@@ -1,0 +1,3171 @@
+---
+title: "MRI Network Analysis"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+Graph Network Analysis of Mouse MRI Data 
+
+This R Notebook contains all code used to reproduce the analyses and figures
+presented in our iScience paper on graph network analysis of TetTag-DREADD mouse fMRI data.
+  Title: Sparse memory ensembles set brain-wide network states to sustain learned associations
+  Authors: Haubrich J, Russo G and Manahan-Vaughan D
+  Publication: iScience (2025) 
+  DOI: 
+
+Data Availability:
+Preprocessed data (ready for analysis) is included in this repository.
+Raw MRI data are available upon request or from Denise Manahan-Vaughan.
+
+License:
+This code is distributed under the MIT License. 
+If you use this code, please acknowledge us by citing the paper.
+
+Contact:
+For questions, feel free to contact me [josue.haubrich@rub.de]
+
+
+
+# Libraries
+```{r}
+library(shadowtext)
+library(ggnewscale)
+library(dplyr)
+library(tidyr)
+library(boot)
+library(purrr)
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(ggbeeswarm)
+library(viridis)
+library(pheatmap)
+library(ggforce)
+library(shadowtext)
+library(ggforce)
+library(ggsci)
+library(gridExtra)
+library(grid)
+library(pheatmap)
+```
+
+# Import data
+
+```{r}
+setwd("YOUR PATH")
+
+# fMRI data
+load(file = "fMRI_data_list.Rda")
+load(file = "Behavior.Rda")
+load(file = "Behavior_control.Rda")
+```
+
+# Functions and parameters
+```{r}
+# Network functions
+source(file = "networks_functions.R")
+
+# Auxiliary tables and functions
+lookup_df <- data.frame(
+  Structure = c("dCA1", "vCA3", "SUBd", "dCA3", "dDG", "vCA1", "vDG", "PoS",
+                "IL", "PrL", "ORB", 
+                "pACC", "aACC",
+                "PIR", 
+                "ENT",
+                "PPC",
+                "iRSP", "aRSP", "pRSP", 
+                "AMY",
+                "VISp", "SSp", "AUDp", 
+                "NAc", "CP",
+                "PVT", "RE", "LDT", "GEN",  "vTH", 
+                "PAG",
+                "LHY"),
+  Region = c("Dorsal Hipp", "Ventral Hipp", "Subiculum", "Dorsal Hipp", "Dorsal Hipp", "Ventral Hipp", "Ventral Hipp", "Subiculum",
+             "Prefrontal cortex", "Prefrontal cortex", "Prefrontal cortex", 
+             "Cingulate cortex", "Cingulate cortex", 
+             "Piriform cortex", 
+             "Limbic cortex",
+             "Parietal cortex",
+             "Retrosplenial cortex", "Retrosplenial cortex", "Retrosplenial cortex", 
+             "Amygdala",
+             "Sensory Cortex", "Sensory Cortex", "Sensory Cortex", 
+             "Striatum", "Striatum",
+             "Thalamus", "Thalamus", "Thalamus", "Thalamus", "Thalamus", 
+             "Midbrain",
+             "Hypothalamus")
+)
+
+ggpchip = function(formula, data, weights) structure(pracma::pchipfun(data$x, data$y), class='ggpchip')
+
+predict.ggpchip = function(object, newdata, se.fit=F, ...) {
+  fit = unclass(object)(newdata$x)
+  if (se.fit) list(fit=data.frame(fit, lwr=fit, upr=fit), se.fit=fit * 0) else fit
+}
+
+palette1 <- c("#C0C2C9", "#0476D0")
+
+# Parameters
+alpha = 0.001
+```
+
+# Networks Pipeline
+Correlate, create g objects, calculate centrality, average networks
+```{r}
+# Apply corr_matrix_threshold ###########################
+matrix_thresholded <- lapply(fMRI_data_list, function(df) {
+  corr_matrix_threshold(df, 
+                        negs = FALSE, 
+                        thresh = alpha, 
+                        thresh.param = 'p', 
+                        p.adjust.method = 'bonferroni',
+                        type = 'spearman') # spearman
+})
+
+# Untresholded matrices ###########################
+
+matrix_unthresholded <- lapply(fMRI_data_list, function(df) {
+  corr_matrix_threshold(df, 
+                        negs = TRUE, 
+                        thresh = -1, 
+                        thresh.param = 'r', 
+                        p.adjust.method = 'bonferroni',
+                        type = 'spearman')
+})
+
+# Create g #####################################################################
+# Apply graph.adjacency to each element of matrix_thresholded
+g_data <- lapply(matrix_thresholded, function(adj_matrix) {
+  graph.adjacency(as.matrix(adj_matrix), mode = "undirected", weighted = TRUE)
+})
+
+# Get centrality ##############################################################
+get_centrality_df <- function(x){
+  cx <- get_centrality_measures(x,
+                                weighted=TRUE, nodal_efficiency=TRUE, normalized=T)
+  centrality <- setNames(cbind(rownames(cx), cx, row.names = NULL), 
+                         c("Structure", "Degree", "Betweenness", "Eigenvector", 
+                           "Closeness", "Transitivity", "Nodal_efficiency"))
+  hub <- as.data.frame(hub_score(x))
+  hub <- setNames(cbind(rownames(hub), hub, row.names = NULL), 
+                  c("Structure", "Hub_score")) 
+  hub <- hub %>% dplyr::select(Structure, Hub_score)
+  centrality <- merge(centrality, hub, by = "Structure")
+  
+  centrality
+}
+
+# Modified get_centrality_df function
+get_centrality_df <- function(x) {
+  # Get existing centrality measures
+  cx <- get_centrality_measures(
+    x,
+    weighted = TRUE,
+    nodal_efficiency = TRUE,
+    normalized = TRUE
+  )
+  centrality <- setNames(
+    cbind(rownames(cx), cx, row.names = NULL),
+    c(
+      "Structure",
+      "Degree",
+      "Betweenness",
+      "Eigenvector",
+      "Closeness",
+      "Transitivity",
+      "Nodal_efficiency"
+    )
+  )
+  
+  # Calculate hub score
+  hub <- hub_score(x, weights = E(x)$weight)$vector
+  hub_df <- data.frame(Structure = V(x)$name, Hub_score = hub)
+  
+  # Calculate strength
+  str <- strength(x, vids = V(x), mode = "all", weights = E(x)$weight)
+  str_df <- data.frame(Structure = V(x)$name, Strength = str)
+  
+  # Calculate PageRank
+  pr <- page_rank(x, directed = FALSE, weights = E(x)$weight)$vector
+  pr_df <- data.frame(Structure = V(x)$name, PageRank = pr)
+  
+  # Calculate coreness
+  core <- coreness(x, mode = "all")
+  core_df <- data.frame(Structure = V(x)$name, Coreness = core)
+  
+  # Calculate diversity
+  div <- diversity(x, weights = E(x)$weight)
+  div_df <- data.frame(Structure = V(x)$name, Diversity = div)
+  
+  # Calculate Harmonic centrality
+  har_cen <- harmonic_centrality(x, weights = E(x)$weight)
+  har_cen_df <- data.frame(Structure = V(x)$name, Harmonic_Centrality = har_cen)
+  
+  # Merge all nodal measures
+  centrality <- centrality %>%
+    left_join(hub_df, by = "Structure") %>%
+    left_join(str_df, by = "Structure") %>%
+    left_join(pr_df, by = "Structure") %>%
+    left_join(core_df, by = "Structure") %>%
+    left_join(div_df, by = "Structure") %>%
+    left_join(har_cen_df, by = "Structure")
+  
+  return(centrality)
+}
+
+centrality_list <-lapply(g_data, get_centrality_df)
+
+# New function to calculate global network features
+calculate_rich_club <- function(g) {
+  # Get the degrees of all nodes
+  degrees <- degree(g)
+  
+  # Get unique degree values
+  k_levels <- sort(unique(degrees))
+  
+  # Initialize vector to store Rich-Club Coefficients
+  rich_club_coefficients <- numeric(length(k_levels))
+  
+  # Calculate the Rich-Club Coefficient for each degree level
+  for (i in seq_along(k_levels)) {
+    k <- k_levels[i]
+    # Nodes with degree greater than k
+    nodes_k <- V(g)[degrees > k]
+    
+    # Skip if not enough nodes
+    if (length(nodes_k) < 2) {
+      rich_club_coefficients[i] <- NA
+      next
+    }
+    
+    # Subgraph induced by nodes_k
+    subgraph_k <- induced_subgraph(g, nodes_k)
+    
+    # Number of edges in the subgraph
+    E_k <- ecount(subgraph_k)
+    # Number of possible edges
+    N_k <- vcount(subgraph_k)
+    possible_edges <- N_k * (N_k - 1) / 2
+    
+    # Calculate the Rich-Club Coefficient
+    rc_coeff <- E_k / possible_edges
+    rich_club_coefficients[i] <- rc_coeff
+  }
+  
+  # Create a data frame with the results
+  rc_df <- data.frame(
+    Degree = k_levels,
+    Rich_Club_Coefficient = rich_club_coefficients
+  )
+  
+  return(rc_df)
+}
+
+### With inverted weights
+get_global_network_measures <- function(x) {
+  # Edge density
+  edge_dens <- edge_density(x, loops = FALSE)
+  
+  # Invert weights for distance-based measures
+  if (!is.null(E(x)$weight)) {
+    inv_weights <- 1 / E(x)$weight
+  } else {
+    inv_weights <- NULL
+  }
+  
+  # Global efficiency
+  global_efficiency <- function(graph, inv_weights) {
+    N <- vcount(graph)
+    sp <- distances(graph, mode = "all", weights = inv_weights)
+    sp[is.infinite(sp)] <- NA  # Replace infinite distances with NA
+    eff <- 1 / sp
+    diag(eff) <- NA  # Ignore self-loops
+    return(sum(eff, na.rm = TRUE) / (N * (N - 1)))
+  }
+  global_eff <- global_efficiency(x, inv_weights)
+  
+  # Edge connectivity
+  edge_conn <- edge_connectivity(x)
+  
+  # Average clustering coefficient
+  avg_transitivity <- transitivity(x, type = "global")
+  
+  # Modularity
+  modularity_value <- if (ecount(x) > 0) {
+    fc <- cluster_fast_greedy(x, weights = E(x)$weight)
+    modularity(fc)
+  } else {
+    NA
+  }
+  
+  # Diameter
+  diam <- diameter(x, weights = inv_weights)
+  
+  # Average path length
+  avg_path_length <- average.path.length(x, weights = inv_weights, directed = FALSE)
+  
+  # Assortativity coefficient
+  assort_coeff <- assortativity_degree(x, directed = FALSE)
+  
+  # Rich-Club Coefficient
+  rc_df <- calculate_rich_club(x)
+  avg_rich_club_coeff <- mean(rc_df$Rich_Club_Coefficient, na.rm = TRUE)
+  
+  # Compile global measures into a dataframe
+  global_measures <- data.frame(
+    Edge_density = edge_dens,
+    Global_efficiency = global_eff,
+    Edge_connectivity = edge_conn,
+    Average_transitivity = avg_transitivity,
+    Modularity = modularity_value,
+    Diameter = diam,
+    Average_path_length = avg_path_length,
+    Assortativity_coefficient = assort_coeff,
+    Average_Rich_Club_Coefficient = avg_rich_club_coeff
+  )
+  
+  return(global_measures)
+}
+
+globalcentrality_list <-lapply(g_data, get_global_network_measures )
+
+## Extract metadata ############################################################
+# Function to add metadata columns and return the modified dataframe
+add_metadata_columns <- function(df, name) {
+  # Split the name into parts
+  parts <- unlist(strsplit(name, "_"))
+  
+  # Add metadata columns
+  df <- df %>%
+    mutate(Group = parts[1],
+           ID = parts[2],
+           Bin = parts[3])
+  
+  return(df)
+}
+
+# Apply the function to each dataframe in the list and bind them together
+centrality_data <- do.call(rbind, lapply(names(centrality_list), function(name) {
+  add_metadata_columns(centrality_list[[name]], name)
+}))
+
+row.names(centrality_data) <- NULL
+
+globalcentrality_data <- do.call(rbind, lapply(names(globalcentrality_list), function(name) {
+  add_metadata_columns(globalcentrality_list[[name]], name)
+}))
+
+row.names(globalcentrality_data) <- NULL
+
+### Boot functions #############################################################
+
+# Define the desired order of bins
+bin_levels <- c("T1", "T2", "T3", "T4")
+
+# Bootstrap function
+boot_mean_diff <- function(data, indices) {
+  d <- data[indices, ]  # Resample the data
+  mean_CTRL <- mean(d$normalized_value[d$Group == "Wt"], na.rm = TRUE)
+  mean_TEST <- mean(d$normalized_value[d$Group == "TetTag"], na.rm = TRUE)
+  return(mean_TEST - mean_CTRL)  # Return the difference in means
+}
+
+
+# Process nodal centrality measures #####################################
+centrality_measures <- centrality_data %>% dplyr::select(2, 4:13) %>% colnames()
+
+centrality_data <- centrality_data %>%
+  mutate(Group = dplyr::recode(Group, "CTRL" = "Wt", "TEST" = "TetTag"),
+         Bin = dplyr::recode(Bin, "S1" = "T1", "S2" = "T2", "S3" = "T3", "S4" = "T4", "S5" = "T5"))
+
+centrality_data$Group <- factor(centrality_data$Group,
+                                          levels = c("Wt", "TetTag"))
+
+process_centrality_measure <- function(centrality_data, target_measure, bin_levels, boot_mean_diff) {
+  # Prepare the data
+  data_normalized <- centrality_data %>%
+    dplyr::select(Structure, Group, ID, Bin, all_of(target_measure)) %>%
+    mutate(Bin = factor(Bin, levels = bin_levels)) %>%
+    filter(!is.na(.data[[target_measure]])) %>%
+    group_by(Group, Structure) %>%
+    mutate(
+      S1_value = mean(.data[[target_measure]][Bin == "T1"], na.rm = TRUE),
+      normalized_value = (.data[[target_measure]] / S1_value) * 100
+    ) %>%
+    filter(Bin != "T5") %>%
+    ungroup()
+  
+  # For each Bin and Structure, perform bootstrapping
+  bootstrap_results <- data_normalized %>%
+    group_by(Bin, Structure) %>%
+    nest() %>%
+    mutate(
+      boot_out = map(data, ~ boot(
+        data = .x,
+        statistic = boot_mean_diff,
+        R = 1000
+      )),
+      ci_95 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.95)),
+      ci_99 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.99)),
+      ci_999 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.999)),
+      ci_95_lower = map_dbl(ci_95, ~ .x$bca[4]),
+      ci_95_upper = map_dbl(ci_95, ~ .x$bca[5]),
+      ci_99_lower = map_dbl(ci_99, ~ .x$bca[4]),
+      ci_99_upper = map_dbl(ci_99, ~ .x$bca[5]),
+      ci_999_lower = map_dbl(ci_999, ~ .x$bca[4]),
+      ci_999_upper = map_dbl(ci_999, ~ .x$bca[5]),
+      p_signif = case_when(
+        (ci_999_lower > 0 & ci_999_upper > 0) | (ci_999_lower < 0 & ci_999_upper < 0) ~ "***",
+        (ci_99_lower > 0 & ci_99_upper > 0) | (ci_99_lower < 0 & ci_99_upper < 0) ~ "**",
+        (ci_95_lower > 0 & ci_95_upper > 0) | (ci_95_lower < 0 & ci_95_upper < 0) ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  
+  # Prepare the plot summary data
+  data_summary <- data_normalized %>%
+    group_by(Group, Bin, Structure) %>%
+    summarise(
+      average = mean(normalized_value, na.rm = TRUE),
+      sd = sd(normalized_value, na.rm = TRUE),
+      sem = sd / sqrt(n()),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Bin = factor(Bin, levels = bin_levels),
+      Structure = as.factor(Structure)
+    )
+  
+  # Prepare annotations
+  some_offset <- 5
+  max_y_positions <- data_normalized %>%
+    group_by(Structure) %>%
+    summarise(
+      y.position = max(normalized_value, na.rm = TRUE) + some_offset,
+      .groups = "drop"
+    )
+  
+  annotations <- bootstrap_results %>%
+    dplyr::select(Structure, p_signif) %>%
+    left_join(max_y_positions, by = "Structure") %>%
+    filter(p_signif != "ns")
+  
+  # Return results as a list
+  list(
+    data_normalized = data_normalized,
+    bootstrap_results = bootstrap_results,
+    data_summary = data_summary,
+    annotations = annotations
+  )
+}
+
+# Boot centrality no structures #################################################
+boot_mean_diff_no_structure <- function(data, indices) {
+  d <- data[indices, ]  # Bootstrap resample the data
+  group_means <- d %>% group_by(Group) %>% summarise(mean_val = mean(normalized_value, na.rm = TRUE))
+  mean_diff <- diff(group_means$mean_val)
+  return(mean_diff)
+}
+
+process_centrality_measure_no_structure <- function(centrality_data, target_measure, bin_levels, boot_mean_diff_no_structure) {
+  # Prepare the data
+  data_normalized <- centrality_data %>%
+    dplyr::select(Group, ID, Bin, all_of(target_measure)) %>%
+    mutate(Bin = factor(Bin, levels = bin_levels)) %>%
+    filter(!is.na(.data[[target_measure]])) %>%
+    group_by(Group) %>%
+    mutate(
+      S1_value = mean(.data[[target_measure]][Bin == "T1"], na.rm = TRUE),
+      normalized_value = (.data[[target_measure]] / S1_value) * 100
+    ) %>%
+    filter(Bin != "T5") %>%
+    ungroup()
+  
+  # Perform bootstrapping across Bins
+  bootstrap_results <- data_normalized %>%
+    group_by(Bin) %>%
+    nest() %>%
+    mutate(
+      boot_out = map(data, ~ boot(
+        data = .x,
+        statistic = boot_mean_diff_no_structure,
+        R = 1000
+      )),
+      ci_95 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.95)),
+      ci_99 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.99)),
+      ci_999 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.999)),
+      ci_95_lower = map_dbl(ci_95, ~ .x$bca[4]),
+      ci_95_upper = map_dbl(ci_95, ~ .x$bca[5]),
+      ci_99_lower = map_dbl(ci_99, ~ .x$bca[4]),
+      ci_99_upper = map_dbl(ci_99, ~ .x$bca[5]),
+      ci_999_lower = map_dbl(ci_999, ~ .x$bca[4]),
+      ci_999_upper = map_dbl(ci_999, ~ .x$bca[5]),
+      p_signif = case_when(
+        (ci_999_lower > 0 & ci_999_upper > 0) | (ci_999_lower < 0 & ci_999_upper < 0) ~ "***",
+        (ci_99_lower > 0 & ci_99_upper > 0) | (ci_99_lower < 0 & ci_99_upper < 0) ~ "**",
+        (ci_95_lower > 0 & ci_95_upper > 0) | (ci_95_lower < 0 & ci_95_upper < 0) ~ "*",
+        TRUE ~ "ns"
+      )
+    ) %>%
+    ungroup()
+  
+  # Prepare the plot summary data
+  data_summary <- data_normalized %>%
+    group_by(Group, Bin) %>%
+    summarise(
+      average = mean(normalized_value, na.rm = TRUE),
+      sd = sd(normalized_value, na.rm = TRUE),
+      sem = sd / sqrt(n()),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Bin = factor(Bin, levels = bin_levels)
+    )
+  
+  # Prepare annotations with proper y.position per Bin
+  some_offset <- 5
+  max_y_positions <- data_normalized %>%
+    group_by(Bin) %>%
+    summarise(
+      y.position = max(normalized_value, na.rm = TRUE) + some_offset,
+      .groups = "drop"
+    )
+  
+  annotations <- bootstrap_results %>%
+    dplyr::select(Bin, p_signif) %>%
+    filter(p_signif != "ns") %>%  # Keep only significant results
+    left_join(max_y_positions, by = "Bin")
+  
+  # Return results as a list
+  list(
+    data_normalized = data_normalized,
+    bootstrap_results = bootstrap_results,
+    data_summary = data_summary,
+    annotations = annotations
+  )
+}
+
+
+# Define bootstrapping function for mean difference across structures
+boot_mean_diff_no_structure <- function(data, indices) {
+  d <- data[indices, ]  # Bootstrap resample the data
+  group_means <- d %>% group_by(Group) %>% summarise(mean_val = mean(normalized_value, na.rm = TRUE))
+  mean_diff <- diff(group_means$mean_val)
+  return(mean_diff)
+}
+
+# Boot global centrality measures ##############################################
+process_global_centrality_measures <- function(
+    globalcentrality_data,
+    bin_levels = c("T1", "T2", "T3", "T4"),
+    boot_mean_diff_func,
+    some_offset = 5  # Adjust based on your data scale
+) {
+  
+  # Prepare the data
+  bootstrap_data <- globalcentrality_data %>%
+    pivot_longer(
+      cols = 1:9,  # Adjust this range based on your data
+      names_to = "Centrality",
+      values_to = "value"
+    ) %>%
+    group_by(Group, Centrality) %>%
+    mutate(
+      S1_value = mean(value[Bin == "T1"], na.rm = TRUE),
+      normalized_value = (value / S1_value) * 100
+    ) %>%
+    ungroup() %>%
+    filter(Bin != "T5") %>%
+    mutate(Bin = factor(Bin, levels = bin_levels))
+  
+  # Define the bootstrap function if not provided
+  if (missing(boot_mean_diff_func)) {
+    boot_mean_diff_func <- function(data, indices) {
+      d <- data[indices, ]  # Resample the data
+      mean_CTRL <- mean(d$normalized_value[d$Group == "Wt"], na.rm = TRUE)
+      mean_TEST <- mean(d$normalized_value[d$Group == "TetTag"], na.rm = TRUE)
+      return(mean_TEST - mean_CTRL)  # Return the difference in means
+    }
+  }
+  
+  # For each Bin and Centrality, perform bootstrapping
+  bootstrap_results <- bootstrap_data %>%
+    group_by(Bin, Centrality) %>%
+    nest() %>%
+    mutate(
+      boot_out = map(data, ~ boot(
+        data = .x,
+        statistic = boot_mean_diff_func,
+        R = 1000
+      ))
+    ) %>%
+    # Extract confidence intervals at different levels
+    mutate(
+      ci_95 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.95)),
+      ci_99 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.99)),
+      ci_999 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.999)),
+      # Extract lower and upper bounds of the confidence intervals
+      ci_95_lower = map_dbl(ci_95, ~ .x$bca[4]),
+      ci_95_upper = map_dbl(ci_95, ~ .x$bca[5]),
+      ci_99_lower = map_dbl(ci_99, ~ .x$bca[4]),
+      ci_99_upper = map_dbl(ci_99, ~ .x$bca[5]),
+      ci_999_lower = map_dbl(ci_999, ~ .x$bca[4]),
+      ci_999_upper = map_dbl(ci_999, ~ .x$bca[5]),
+      # Assign significance levels
+      p_signif = case_when(
+        (ci_999_lower > 0 & ci_999_upper > 0) | (ci_999_lower < 0 & ci_999_upper < 0) ~ "***",
+        (ci_99_lower > 0 & ci_99_upper > 0) | (ci_99_lower < 0 & ci_99_upper < 0) ~ "**",
+        (ci_95_lower > 0 & ci_95_upper > 0) | (ci_95_lower < 0 & ci_95_upper < 0) ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  
+  # Prepare the plot data
+  plot_data_global_boot <- bootstrap_data %>%
+    group_by(Group, Bin, Centrality) %>%
+    summarise(
+      average = mean(normalized_value, na.rm = TRUE),
+      sd = sd(normalized_value, na.rm = TRUE),
+      sem = sd / sqrt(n()),
+      .groups = "drop"
+    ) %>%
+    mutate(Bin = factor(Bin, levels = bin_levels))
+  
+  # Calculate y.position for annotations
+  max_y_positions <- plot_data_global_boot %>%
+    mutate(y_max = average + sem) %>%
+    group_by(Bin, Centrality) %>%
+    summarise(y.position = max(y_max, na.rm = TRUE) + some_offset, .groups = "drop")
+  
+  # Prepare annotations
+  annotations <- bootstrap_results %>%
+    dplyr::select(Bin, Centrality, p_signif) %>%
+    left_join(max_y_positions, by = c("Bin", "Centrality")) %>%
+    filter(p_signif != "ns") %>%
+    mutate(Bin = factor(Bin, levels = bin_levels))
+  
+  # Return results as a list
+  list(
+    bootstrap_data = bootstrap_data,
+    bootstrap_results = bootstrap_results,
+    plot_data_global_boot = plot_data_global_boot,
+    annotations = annotations
+  )
+}
+
+# Tresholding averaged matrices ################################################
+## 1) Thresholding Based on Consistency Across Subjects
+# Set a Proportion Threshold: Retain connections that are significant in a certain percentage of subjects (e.g., 75%).
+# Binary Masking: Create a binary mask where each connection is 1 if it is significant in the specified proportion of subjects and 0 otherwise.
+# Apply the Mask to the Averaged Matrix: Multiply the averaged correlation matrix by the binary mask to retain only consistent connections.
+# 
+# Reflects Consistency: Highlights connections that are reliably significant across subjects.
+# Arbitrary Threshold Selection: The choice of proportion threshold can be subjective.
+
+threshold_consistency_network_fisher_z <- function(
+  time_series_list,
+  group = NULL,
+  bin = NULL,
+  consistency_threshold = 0.75,
+  alpha = 0.001,
+  adjust_method = "bonferroni",   # Method for p-value adjustment
+  corr_type = "spearman",    # Type of correlation: "pearson" or "spearman"
+  set_negative_to_zero = TRUE
+) {
+  # Load necessary library
+  if (!requireNamespace("Hmisc", quietly = TRUE)) {
+    install.packages("Hmisc")
+  }
+  library(Hmisc)  # For correlation computations with p-values
+  
+  # Filter the time_series_list based on group and bin
+  # Extract the names of the time series
+  ts_names <- names(time_series_list)
+  
+  # Initialize logical vector for filtering
+  include_ts <- rep(TRUE, length(time_series_list))
+  
+  # If group is specified, filter by group
+  if (!is.null(group)) {
+    include_ts <- include_ts & grepl(paste0("^", group, "_"), ts_names)
+  }
+  
+  # If bin is specified, filter by bin
+  if (!is.null(bin)) {
+    include_ts <- include_ts & grepl(paste0("_", bin, "$"), ts_names)
+  }
+  
+  # Subset the time_series_list
+  filtered_time_series_list <- time_series_list[include_ts]
+  
+  # Check if any time series remain after filtering
+  n_subjects <- length(filtered_time_series_list)
+  if (n_subjects == 0) {
+    stop("No time series data found for the specified group and bin.")
+  }
+  
+  # Assuming all time series have the same number of regions (nodes)
+  n_nodes <- ncol(filtered_time_series_list[[1]])
+  node_names <- colnames(filtered_time_series_list[[1]])
+  
+  # Initialize arrays to store correlations, z-transformed correlations, and p-values
+  correlation_array <- array(NA, dim = c(n_nodes, n_nodes, n_subjects))
+  z_correlation_array <- array(NA, dim = c(n_nodes, n_nodes, n_subjects))
+  p_value_array <- array(NA, dim = c(n_nodes, n_nodes, n_subjects))
+  
+  # Loop over each subject to compute correlation matrices, z-transformed correlations, and p-values
+  for (s in seq_len(n_subjects)) {
+    # Extract time series data for the subject
+    ts_data <- as.matrix(filtered_time_series_list[[s]])
+    
+    # Compute the correlation matrix with p-values
+    corr_result <- Hmisc::rcorr(ts_data, type = corr_type)
+    
+    # Store the correlation coefficients
+    corr_matrix <- corr_result$r
+    correlation_array[,,s] <- corr_matrix
+    
+    # Store the p-values
+    p_values <- corr_result$P
+    
+    # Adjust p-values for multiple comparisons if needed
+    if (adjust_method != "bonferroni") {
+      p_values_vector <- as.vector(p_values)
+      p_adjusted_vector <- p.adjust(p_values_vector, method = adjust_method)
+      p_values <- matrix(p_adjusted_vector, nrow = n_nodes, ncol = n_nodes)
+    }
+    
+    # Store the (adjusted) p-values
+    p_value_array[,,s] <- p_values
+    
+    # Prepare the correlation matrix for z-transformation
+    # Exclude diagonal elements (set to NA)
+    diag(corr_matrix) <- NA
+    
+    # Handle perfect correlations to avoid infinities
+    epsilon <- .Machine$double.eps
+    corr_matrix[corr_matrix >= 1] <- 1 - epsilon
+    corr_matrix[corr_matrix <= -1] <- -1 + epsilon
+    
+    # Apply Fisher z-transformation
+    z_corr_matrix <- atanh(corr_matrix)
+    
+    # Store the z-transformed correlation matrix
+    z_correlation_array[,,s] <- z_corr_matrix
+  }
+  
+  # Determine significance based on p-values
+  significance_array <- p_value_array < alpha
+  
+  # Compute the proportion of subjects where each connection is significant
+  proportion_significant <- apply(significance_array, c(1, 2), mean, na.rm = TRUE)
+  
+  # Create a mask for connections significant in at least the specified threshold of subjects
+  consistent_mask <- proportion_significant >= consistency_threshold
+  
+  # Compute the mean z-score for each connection across subjects
+  mean_z_correlation <- apply(z_correlation_array, c(1, 2), mean, na.rm = TRUE)
+  
+  # Apply the inverse Fisher z-transformation to get back to correlation coefficients
+  mean_correlation <- tanh(mean_z_correlation)
+  
+  # Apply the mask to the mean correlation matrix
+  mean_correlation[!consistent_mask] <- 0  # Set non-significant correlations to zero
+  
+  # Optionally set negative correlations to zero
+  if (set_negative_to_zero) {
+    mean_correlation[mean_correlation < 0] <- 0
+  }
+  
+  # Set diagonal elements to zero
+  diag(mean_correlation) <- 0
+  
+  # Assign row and column names
+  rownames(mean_correlation) <- node_names
+  colnames(mean_correlation) <- node_names
+  
+  # Return the thresholded network
+  return(mean_correlation)
+}
+
+### Parameters ####
+alpha <- alpha                  # Significance level
+adjust_method <- "bonferroni"  # P-value adjustment method: "none", "fdr", "bonferroni", etc.
+corr_type <- "spearman"        # Choose "pearson" or "spearman"
+consistency_threshold <- 0.75
+
+avg_TreshMatrix_CTRL_S4 <- threshold_consistency_network_fisher_z (
+  time_series_list = fMRI_data_list,
+  group = "CTRL",
+  bin = "S4",
+  consistency_threshold = consistency_threshold, 
+  alpha =alpha,
+  adjust_method = adjust_method,   
+  corr_type = corr_type) 
+
+avg_TreshMatrix_TEST_S4 <- threshold_consistency_network_fisher_z (
+  time_series_list = fMRI_data_list,
+  group = "TEST",
+  bin = "S4",
+  consistency_threshold = consistency_threshold,
+  alpha = alpha,
+  adjust_method = adjust_method,   
+  corr_type = corr_type)  
+
+# Create g ##########
+
+g_CTRL_S4 <- graph_from_adjacency_matrix(
+  avg_TreshMatrix_CTRL_S4,
+  mode = "undirected",
+  weighted = TRUE,
+  diag = FALSE)
+
+g_TEST_S4 <- graph_from_adjacency_matrix(
+  avg_TreshMatrix_TEST_S4,
+  mode = "undirected",
+  weighted = TRUE,
+  diag = FALSE)
+
+## Assign Regions
+
+region_lookup <- setNames(lookup_df$Region, lookup_df$Structure)
+V(g_CTRL_S4)$Region <- region_lookup[V(g_CTRL_S4)$name]
+V(g_TEST_S4)$Region <- region_lookup[V(g_TEST_S4)$name]
+
+```
+
+# Clustering
+```{r}
+comm_ctrl <- cluster_louvain(g_CTRL_S4)
+comm_test <- cluster_louvain(g_TEST_S4)
+
+V(g_CTRL_S4)$community <- membership(comm_ctrl)
+V(g_TEST_S4)$community <- membership(comm_test)
+
+
+### Community Layouts
+## Layout function
+layout_communities_by_membership <- function(graph, membership, 
+                                             predefined_centroids, 
+                                             community_scaling_factor = 1, 
+                                             centroid_scaling_factor = 1, 
+                                             layout_method = layout_with_fr, 
+                                             seed = NULL) {
+  
+  if(!is.null(seed)) {
+    set.seed(seed)
+  }
+  
+  # Initialize an empty layout matrix
+  layout_matrix <- matrix(0, nrow = vcount(graph), ncol = 2)
+  
+  # For each unique community, determine the local layout and adjust based on centroid
+  unique_communities <- unique(membership)
+  
+  for(community in unique_communities) {
+    # Get the subgraph for current community
+    subgraph <- induced_subgraph(graph, which(membership == community))
+    
+    # Get the local layout for the subgraph
+    local_layout <- layout_method(subgraph) * community_scaling_factor
+    
+    # Determine the centroid offset
+    centroid_offset <- as.numeric(predefined_centroids[[as.character(community)]])
+    
+    # Update the layout matrix for nodes in current subgraph
+    layout_matrix[which(membership == community), ] <- t(t(local_layout) + centroid_offset * centroid_scaling_factor)
+  }
+  
+  return(layout_matrix)
+}
+
+## Circle centroids
+generate_circle_centroids <- function(n, radius = 2) {
+  circle_centroids <- list()
+  
+  for (i in 1:n) {
+    theta <- (i-1) * (2 * pi / n)
+    x <- radius * cos(theta)
+    y <- radius * sin(theta)
+    circle_centroids[[as.character(i)]] <- c(x, y)
+  }
+  
+  return(circle_centroids)
+}
+
+## Spiral centroids
+
+generate_spiral_centroids <- function(n, initial_radius = 0.5, spacing = 1) {
+  spiral_centroids <- list()
+  angle = 0
+  
+  for (i in 1:n) {
+    r = initial_radius + spacing * sqrt(i)
+    x = r * cos(angle)
+    y = r * sin(angle)
+    spiral_centroids[[as.character(i)]] <- c(x, y)
+    
+    angle = angle + (spacing / r)
+  }
+  
+  return(spiral_centroids)
+}
+
+##  Force-directed centroids 
+generate_force_centroids <- function(graph, membership, layout_method = layout_with_fr, seed = 123) {
+  # Set the seed for reproducibility
+  set.seed(seed)
+  
+  # Number of communities
+  n_communities <- max(membership)
+  
+  # Create an empty adjacency matrix for the meta-graph
+  meta_adjacency <- matrix(0, nrow = n_communities, ncol = n_communities)
+  
+  # Populate the adjacency matrix with interactions between communities
+  E(graph)$weight <- 1  # Assuming equal weight for all edges in the original graph
+  for(e in E(graph)) {
+    source_comm <- membership[ends(graph, e)[1]]
+    target_comm <- membership[ends(graph, e)[2]]
+    meta_adjacency[source_comm, target_comm] <- meta_adjacency[source_comm, target_comm] + E(graph)[e]$weight
+    meta_adjacency[target_comm, source_comm] <- meta_adjacency[target_comm, source_comm] + E(graph)[e]$weight
+  }
+  
+  # Create the meta-graph from the adjacency matrix
+  meta_graph <- graph_from_adjacency_matrix(meta_adjacency, mode = "undirected", weighted = TRUE)
+  
+  # Use the specified layout method to get the positions of the centroids
+  layout <- layout_method(meta_graph)
+  
+  # Convert the layout matrix to a list format for centroids
+  centroids_list <- list()
+  for(i in 1:nrow(layout)) {
+    centroids_list[[as.character(i)]] <- layout[i, ]
+  }
+  
+  return(centroids_list)
+}
+
+```
+
+# R comparisons
+```{r}
+library(reshape2)
+library(stringr)
+
+# Initialize an empty list to store the transformed data frames
+transformed_list <- list()
+
+# Loop through each item in the list
+for(i in names(matrix_unthresholded)) {
+  # Convert the matrix to a data frame and perform the operations
+  temp_matrix <- as.matrix(matrix_unthresholded[[i]])
+  diag(temp_matrix) <- NA
+  temp_df <- melt(temp_matrix, na.rm = TRUE)
+  
+  # Extract group, id, and bin from the name
+  parts <- str_split(i, "_")[[1]]
+  group <- parts[1]
+  id <- parts[2]
+  bin <- parts[3]
+  
+  # Add the extracted parts as new columns
+  temp_df$Group <- group
+  temp_df$ID <- id
+  temp_df$Bin <- bin
+  
+  # Store the transformed data frame in the list
+  transformed_list[[i]] <- temp_df
+}
+
+# Combine all data frames into a single data frame
+combined_r <- bind_rows(transformed_list)
+
+combined_r <- combined_r %>%
+  left_join(lookup_df, by = c("Var1" = "Structure")) %>%
+  rename(Region_Var1 = Region) %>%
+  left_join(lookup_df, by = c("Var2" = "Structure")) %>%
+  rename(Region_Var2 = Region)
+
+```
+
+## Heatmaps
+```{r}
+avg_UntreshMatrix_CTRL_S4 <- threshold_consistency_network_fisher_z (
+  time_series_list = fMRI_data_list,
+  group = "CTRL",
+  bin = "S4",
+  consistency_threshold = 0, 
+  alpha =1,
+  adjust_method = ,   
+  corr_type = corr_type) 
+
+avg_UntreshMatrix_TEST_S4 <- threshold_consistency_network_fisher_z (
+  time_series_list = fMRI_data_list,
+  group = "TEST",
+  bin = "S4",
+  consistency_threshold = 0,
+  alpha = 1,
+  adjust_method = "none",   
+  corr_type = corr_type)  
+
+annotation_df <- subset(lookup_df)
+rownames(annotation_df) <- annotation_df$Structure
+annotation_df <- annotation_df %>% select(-Structure)
+
+region_colors <- c(
+  "Dorsal Hipp" = "#1b9e77",
+  "Ventral Hipp" = "#d95f02",
+  "Subiculum" = "#7570b3",
+  "Prefrontal cortex" = "#e7298a",
+  "Cingulate cortex" = "#66a61e",
+  "Parietal cortex" = "#e6ab02",
+  "Retrosplenial cortex" = "#1f78b4",
+  "Striatum" = "#fb9a99",
+  "Thalamus" = "#fdbf6f"
+)
+annotation_colors <- list(Region = region_colors)
+
+p_matrix_wt <- pheatmap(avg_UntreshMatrix_CTRL_S4,
+         clustering_method = "complete",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         annotation_row = annotation_df,
+         annotation_col = annotation_df,
+         annotation_colors = annotation_colors,
+         breaks = seq(0, 0.7, length.out = 100),
+         color = colorRampPalette(c("white", "blue"))(99),
+         legend = TRUE,                     
+         annotation_legend = TRUE,
+         labels_row = NULL,                       
+         labels_col = NULL,  
+         annotation_names_row = FALSE,
+         annotation_names_col = FALSE,
+        treeheight_row = 10,                    
+         treeheight_col = 12  ,
+         main = "Wt",
+         fontsize = 6,
+         silent = FALSE,
+         cellwidth = 7, cellheight = 7
+         # cutree_rows = 4,
+         # cutree_cols = 4,  
+         )
+
+p_matrix_test <- pheatmap::pheatmap(avg_UntreshMatrix_TEST_S4,
+         clustering_method = "complete",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         annotation_row = annotation_df,
+         annotation_col = annotation_df,
+         annotation_colors = annotation_colors,
+         breaks = seq(0, 0.7, length.out = 100),
+         color = colorRampPalette(c("white", "blue"))(99),
+         legend = TRUE,                     
+         annotation_legend = TRUE,              
+         labels_row = NULL,                       
+         labels_col = NULL,  
+         annotation_names_row = FALSE,
+         annotation_names_col = FALSE,
+         treeheight_row = 10,                    
+         treeheight_col = 12  ,
+         main = "TetTag",
+         fontsize = 6,
+         silent = F,
+          cellwidth = 7, cellheight = 7
+         # cutree_rows = 4,
+         # cutree_cols = 4,
+         )
+
+# Panel ########
+grob_ctrl <- p_matrix_wt$gtable
+grob_test <- p_matrix_test$gtable
+
+grid.arrange(grob_ctrl, grob_test, ncol = 2)
+
+```
+
+## Mean R values
+```{r}
+custom_theme_r <- function() {
+  theme_classic() +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      axis.text.x = element_text(size = 6.5), # previously 6
+      axis.text.y = element_text(size = 6.5, margin = margin(r = 1)),
+      axis.ticks.x.bottom = element_blank(),
+      axis.line = element_line(linewidth = 0.08),
+      axis.ticks = element_line(linewidth = 0.05),
+      axis.ticks.length = unit(0.05, "cm"),  # Shorter ticks
+      legend.text = element_text(size = 8),
+      strip.background = element_rect(fill = "#ebeff2", color = NA),
+      strip.text = element_text(size = 7, margin = margin(1, 1, 1, 1)),
+      axis.title.y = element_text(size = 8),
+      axis.title.x = element_text(size = 7),
+      plot.title = element_text(size = 8)
+    )
+}
+
+combined_r <- combined_r %>%
+  mutate(Group = dplyr::recode(Group, "CTRL" = "Wt", "TEST" = "TetTag"),
+         Bin = dplyr::recode(Bin, "S1" = "T1", "S2" = "T2", "S3" = "T3", "S4" = "T4", "S5" = "T5"))
+
+combined_r$Group <- factor(combined_r$Group,
+                                          levels = c("Wt", "TetTag"))
+
+# Histogram
+p_hist_r <- combined_r %>%
+  filter(Bin != "T5") %>%
+  distinct(value, .keep_all = TRUE) %>%
+  ggplot(aes(x = value, fill = Group)) +
+  geom_histogram(binwidth = 0.2, position = "dodge", color = "black", alpha = 0.9, linewidth = 0.2) +
+  facet_wrap(~ Bin, nrow = 1) +
+  labs(x = "R Value", y = "Frequency") +
+  scale_fill_manual(values = palette1) +
+  theme_classic() +
+  custom_theme_r()
+
+combined_r %>%
+  filter(Bin != "S5") %>%
+  #group_by(Group, Bin, Region_Var1) %>%
+  ggplot(aes(x = Bin, y = value, fill = Region_Var1, group = Region_Var1))+
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black") +
+  stat_summary(fun = mean, geom = "line", size = 0.6, alpha = 0.8)+
+  stat_summary(fun = mean, geom = "point", shape = 21, size = 3, color = "black") +
+  facet_wrap(~Group)+
+  labs(y = "Mean r") +
+  scale_fill_d3() +
+  theme_classic()+
+  custom_theme_r()
+
+combined_r %>%
+  filter(Bin != "S5") %>%
+  #group_by(Group, Bin, Region_Var1) %>%
+  ggplot(aes(x = Bin, y = value, fill = Group, group = Group))+
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black") +
+  #stat_summary(aes(color = Group), fun = mean, geom = "line", size = 0.6, alpha = 0.8)+
+  geom_line(data = combined_r %>%
+              filter(Bin != "S5") %>%
+    group_by(Group, Bin, Region_Var1) %>%
+    reframe(value = mean(value)),
+    aes(color = Group), size = 0.7, stat = "smooth",  method='ggpchip', se=F)+
+  stat_summary(fun = mean, geom = "point", shape = 21, size = 3, color = "black") +
+  facet_wrap(~Region_Var1, scales = "free")+
+  stat_compare_means(aes(label = after_stat(p.signif)),
+                     method = "t.test", hide.ns = TRUE, size = 4, show.legend = FALSE, label.y = 0.18, bracket.size = 1,
+                     symnum.args = list(cutpoints = c(0, 0.001, 0.01, 0.05, 1), symbols = c("***", "**", "*", "ns")))+
+  labs(y = "Mean r")+
+  scale_fill_manual(values = palette1) +
+  scale_color_manual(values = palette1) +
+  theme_classic() +
+  custom_theme_r()
+
+p_mean_r <- combined_r %>%
+  select(-Var2, -Region_Var2) %>%
+  group_by(Group, ID, Bin) %>%
+  reframe(value = mean(value)) %>%
+  filter(Bin != "T5") %>%
+  #group_by(Group, Bin, Region_Var1) %>%
+  ggplot(aes(x = Bin, y = value, fill = Group, group = Group))+
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1, linewidth = 0.1, color = "black") +
+  geom_line(data = combined_r %>%
+              filter(Bin != "T5") %>%
+    group_by(Group, Bin) %>%
+    reframe(value = mean(value)),
+    aes(color = Group), size = 0.7, stat = "smooth",  method='ggpchip', se=F)+
+  stat_summary(fun = mean, geom = "point", shape = 21, size = 2, color = "black") +
+  stat_compare_means(aes(label = after_stat(p.signif)),
+                     method = "t.test", hide.ns = TRUE, size = 4, show.legend = FALSE, label.y = 0.18, bracket.size = 1,
+                     symnum.args = list(cutpoints = c(0, 0.001, 0.01, 0.05, 1), symbols = c("***", "**", "*", "ns")))+
+  labs(y = "Mean r")+
+  scale_fill_manual(values = palette1) +
+  scale_color_manual(values = palette1) +
+  theme_classic() +
+  custom_theme_r()
+
+
+
+# Panel
+grid.arrange(p_hist_r + theme(legend.position = "none"), p_mean_r + theme(legend.position = "none"), ncol = 2, widths = unit(c(10, 4), "cm"),
+                           heights = unit(4, "cm")
+                          )
+# Statistics ###############
+combined_r %>%
+  select(-Var2, -Region_Var2) %>%
+  group_by(Group, ID, Bin) %>%
+  reframe(value = mean(value)) %>%
+  filter(Bin != "T5") %>%
+  ungroup() %>%
+  group_by(Bin) %>%
+  t_test(value ~ Group)
+
+combined_r %>%
+  select(-Var2, -Region_Var2) %>%
+  group_by(Group, ID, Bin) %>%
+  reframe(value = mean(value)) %>%
+  filter(Bin != "T5") %>%
+  ungroup() %>%
+  group_by(Group) %>%
+  pairwise_t_test(value ~ Bin)
+
+## Anova
+
+combined_r %>%
+  select(-Var2, -Region_Var2) %>%
+  group_by(Group, ID, Bin) %>%
+  reframe(value = mean(value)) %>%
+  filter(Bin != "T5") %>%
+  ungroup() %>%
+  group_by(Bin) %>%
+  shapiro_test(value)
+
+x <- combined_r %>%
+  select(-Var2, -Region_Var2) %>%
+  group_by(Group, ID, Bin) %>%
+  reframe(value = mean(value)) %>%
+  filter(Bin != "T5") %>%
+  #filter(Bin == "T1" & Group == 'TetTag-hM3Dq') %>%
+  filter(Group == 'Wt') %>%
+  ungroup()
+
+shapiro.test(x$value)
+
+combined_r %>%
+  select(-Var2, -Region_Var2) %>%
+  group_by(Group, ID, Bin) %>%
+  reframe(value = mean(value)) %>%
+  filter(Bin != "T5") %>%
+  ungroup() %>%
+  anova_test(
+    dv = value,       # Dependent variable
+    wid = ID,           # Within-subject identifier
+    within = Bin, # Within-subject factors
+    between = Group     # Between-subject factor
+  ) %>%
+  get_anova_table()
+
+```
+
+
+# Merged networks
+
+## Test
+```{r}
+set.seed(124)
+layout_test <- layout_with_fr(g_TEST_S4)
+
+tkplot(g_TEST_S4, layout = layout_test)
+
+updated_layout_TEST_S4 <- tk_coords(1)
+
+# saveRDS(updated_layout_TEST_S4, file = "updated_layout_TEST_S4.rds")
+
+updated_layout_TEST_S4 <- readRDS("updated_layout_TEST_S4.rds")
+
+p_g_test <- ggraph(g_TEST_S4, layout = updated_layout_TEST_S4) +
+  geom_mark_hull(aes(x = x, y = y,
+                     fill = factor(membership(comm_test)), 
+                     anchors = NULL), color = "white", concavity = 8, alpha = 0.2, show.legend = F) +
+  scale_fill_d3(name = "Communities") +
+  ggnewscale::new_scale_fill()+
+  geom_edge_link0(aes(edge_colour = weight, edge_width = weight, alpha = weight)) +
+  geom_node_point(aes(fill = hub_score(g_TEST_S4)$vector, size = hub_score(g_TEST_S4)$vector),shape = 21) +
+  geom_shadowtext(aes(x = x, y = y, label = name), size = 2.5, fontface="bold", repel = TRUE, color = "white", bg.colour='black')+
+  scale_edge_color_continuous(low = "#d1d1d1", high = "black", name = "Weight") +
+  scale_fill_viridis(name = "Hub score", option = "H")+
+  scale_edge_width(range = c(0.1, 2), name = "Weight") +
+  scale_size(range = c(6, 10), name = "Hub score") +
+  theme_void()+
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 9)
+  )+
+  guides(#size= guide_legend("Degree"), 
+    #fill = FALSE, 
+    size = FALSE,
+    color = FALSE, 
+    apha = FALSE,
+    #edge_colour = FALSE, 
+    width = FALSE,
+    edge_width = FALSE)
+
+```
+
+## Control
+```{r}
+set.seed(123)
+layout_control <- layout_with_fr(g_CTRL_S4)
+
+tkplot(g_CTRL_S4, layout = layout_control)
+
+updated_layout_CTRL_S4 <- tk_coords(2)
+
+# saveRDS(updated_layout_CTRL_S4, file = "updated_layout_CTRL_S4.rds")
+
+ updated_layout_CTRL_S4 <- readRDS("updated_layout_CTRL_S4.rds")
+
+p_g_ctrl <- ggraph(g_CTRL_S4, layout = updated_layout_CTRL_S4) +
+  geom_mark_hull(aes(x = x, y = y,
+                     fill = factor(membership(comm_ctrl)), 
+                     anchors = NULL), color = "white", concavity = 8, alpha = 0.2, show.legend = F) +
+  scale_fill_d3(name = "Communities") +
+  ggnewscale::new_scale_fill()+
+  geom_edge_link0(aes(edge_colour = weight, edge_width = weight, alpha = weight)) +
+  geom_node_point(aes(fill = hub_score(g_CTRL_S4)$vector, size = hub_score(g_CTRL_S4)$vector),shape = 21) +
+  geom_shadowtext(aes(x = x, y = y, label = name), size = 2.5, fontface="bold", repel = TRUE, color = "white", bg.colour='black')+
+  scale_edge_color_continuous(low = "#d1d1d1", high = "black", name = "Weight") +
+  scale_fill_viridis(name = "Hub score", option = "H")+
+  scale_edge_width(range = c(0.1, 2), name = "Weight") +
+  scale_size(range = c(6, 10), name = "Hub score") +
+  theme_void()+
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 9)
+  )+
+  guides(#size= guide_legend("Degree"), 
+    #fill = FALSE, 
+    size = FALSE,
+    color = FALSE, 
+    apha = FALSE,
+    #edge_colour = FALSE, 
+    width = FALSE,
+    edge_width = FALSE)
+```
+
+## Panel
+```{r}
+# 6 x 4
+ggarrange(p_g_ctrl, p_g_test)
+
+```
+
+
+
+# Centrality
+## T4 nodal
+```{r}
+## Bootstrap ##################################################################
+set.seed(86)
+
+nodalresults_list_unilateral <- setNames(
+  lapply(centrality_measures, function(measure) {
+    process_centrality_measure(
+      centrality_data = centrality_data,
+      target_measure = measure,
+      bin_levels = bin_levels,
+      boot_mean_diff = boot_mean_diff
+    )
+  }),
+  centrality_measures
+)
+
+# Access the results #######################################################
+data_degree_unilateral <- nodalresults_list_unilateral$Degree$data_normalized
+bootstrap_degree_unilateral <- nodalresults_list_unilateral$Degree$bootstrap_results
+data_summary_degree_unilateral <- nodalresults_list_unilateral$Degree$data_summary
+annotations_degree_unilateral <- nodalresults_list_unilateral$Degree$annotations
+
+data_hubscore_unilateral <- nodalresults_list_unilateral$Hub_score$data_normalized
+bootstrap_hubscore_unilateral <- nodalresults_list_unilateral$Hub_score$bootstrap_results
+data_summary_hubscore_unilateral <- nodalresults_list_unilateral$Hub_score$data_summary
+annotations_hubscore_unilateral <- nodalresults_list_unilateral$Hub_score$annotations
+
+data_nodaleff_unilateral <- nodalresults_list_unilateral$Nodal_efficiency$data_normalized
+bootstrap_nodaleff_unilateral <- nodalresults_list_unilateral$Nodal_efficiency$bootstrap_results
+data_summary_nodaleff_unilateral <- nodalresults_list_unilateral$Nodal_efficiency$data_summary
+annotations_nodaleff_unilateral <- nodalresults_list_unilateral$Nodal_efficiency$annotations
+
+data_transitivity_unilateral <- nodalresults_list_unilateral$Transitivity$data_normalized
+bootstrap_transitivity_unilateral <- nodalresults_list_unilateral$Transitivity$bootstrap_results
+data_summary_transitivity_unilateral <- nodalresults_list_unilateral$Transitivity$data_summary
+annotations_transitivity_unilateral <- nodalresults_list_unilateral$Transitivity$annotations
+
+data_harmonic_unilateral <- nodalresults_list_unilateral$Harmonic_Centrality$data_normalized
+bootstrap_harmonic_unilateral <- nodalresults_list_unilateral$Harmonic_Centrality$bootstrap_results
+data_summary_harmonic_unilateral <- nodalresults_list_unilateral$Harmonic_Centrality$data_summary
+annotations_harmonic_unilateral <- nodalresults_list_unilateral$Harmonic_Centrality$annotations
+
+data_strength_unilateral <- nodalresults_list_unilateral$Strength$data_normalized
+bootstrap_strength_unilateral <- nodalresults_list_unilateral$Strength$bootstrap_results
+data_summary_strength_unilateral <- nodalresults_list_unilateral$Strength$data_summary
+annotations_strength_unilateral <- nodalresults_list_unilateral$Strength$annotations
+
+data_betweenness_unilateral <- nodalresults_list_unilateral$Betweenness$data_normalized
+bootstrap_betweenness_unilateral <- nodalresults_list_unilateral$Betweenness$bootstrap_results
+data_summary_betweenness_unilateral <- nodalresults_list_unilateral$Betweenness$data_summary
+annotations_betweenness_unilateral <- nodalresults_list_unilateral$Betweenness$annotations
+
+# Plots ########################################################################
+
+# Theme #######################################################################
+custom_theme_nodal <- function() {
+  theme_classic() +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      axis.text.x = element_blank(),
+      axis.text.y = element_text(size = 6, margin = margin(r = 1)),
+      axis.ticks.x.bottom = element_blank(),
+      axis.line = element_line(linewidth = 0.08),
+      axis.ticks = element_line(linewidth = 0.05),
+      axis.ticks.length = unit(0.05, "cm"),  # Shorter ticks
+      legend.text = element_text(size = 8),
+      strip.background = element_rect(fill = "#ebeff2", color = NA),
+      strip.text = element_text(size = 7, margin = margin(1, 1, 1, 1)),
+      axis.title.y = element_text(size = 8)
+    )
+}
+
+# Hub score ####################################################################
+
+bootstrap_hubscore_unilateral %>% select(-data, -boot_out, -ci_95, -ci_99, -ci_999) %>% filter(p_signif != "ns")
+
+annotations_hubscore_unilateral <- annotations_hubscore_unilateral %>%
+  mutate(y.position = case_when(
+    Structure == "dCA1" ~ 135,
+    Structure == "dCA3" ~ 150,
+    Structure == "dDG" ~ 155,
+    Structure == "iRSP" ~ 175,
+    Structure == "pACC" ~ 175,
+    Structure == "PPC" ~ 140,
+    Structure == "PVT" ~ 195,
+    Structure == "RE" ~ 165,
+    TRUE ~ y.position  # Keep original value if no condition is met
+  ))
+
+# Bar
+p_hub_nodes <- data_hubscore_unilateral %>%
+  filter(Bin == "T4") %>%
+  ggplot(aes(x = Group, y = normalized_value, fill = Group, group = Group)) +
+  stat_summary(fun = mean, geom = "bar", size = 0.2, color = "black", alpha = 1, width = 0.9) +
+  stat_summary(fun.data = mean_cl_boot, geom = "errorbar", width = 0.2, linewidth = 0.2, color = "black") +
+  geom_beeswarm(shape = 21, fill = "white", alpha = 1, size = 0.8, stroke = 0.25, show.legend = F) +
+  facet_wrap(~ Structure, scales = "free", nrow = 3) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.0)),
+    breaks = pretty_breaks(n = 4),
+    limits = function(x) c(min(x, na.rm = TRUE) * 0.98, max(x, na.rm = TRUE) * 1.1)
+  ) +
+  geom_text(data = annotations_hubscore_unilateral %>% filter(Bin == "T4"),
+    aes(x = 1.5, y = y.position, label = p_signif),
+    inherit.aes = FALSE,  size = 4, vjust = 0.8) +
+  theme_classic() +
+  custom_theme_nodal() +
+  labs(
+    x = NULL,
+    y = "Hub score"
+  ) +
+  scale_fill_manual(values = palette1)
+
+# Rank ___________________________________
+
+library(forcats)
+
+# Prepare data with numeric conversion for Structure
+data_hubscore_unilateral_filtered <- data_hubscore_unilateral %>%
+  filter(Bin == "T4", Group == "Wt") %>%
+  group_by(Structure) %>%
+  reframe(normalized_value = mean(normalized_value, na.rm = TRUE)) %>%
+  arrange(desc(normalized_value)) %>%
+  mutate(Structure_numeric = as.numeric(factor(Structure, levels = unique(Structure))))
+
+# Interpolate the line to create a smooth curve without filtering out values
+spline_df <- as.data.frame(spline(data_hubscore_unilateral_filtered$Structure_numeric, 
+                                  data_hubscore_unilateral_filtered$normalized_value, 
+                                  n = 200, method = "hyman"))
+
+# Prepare gradient data frame to create gradient effect
+grad_df <- data.frame(
+  yintercept = seq(0, max(spline_df$y), length.out = 200),
+  alpha = seq(0.2, 0, length.out = 200)
+)
+
+# Plotting with coord_cartesian to limit y-axis without filtering data
+p_hubrank_wt <- ggplot(data_hubscore_unilateral_filtered, aes(x = Structure_numeric, y = normalized_value)) + 
+  geom_area(data = spline_df, aes(x = x, y = y), fill = "#565656", alpha = 0.35) + 
+  geom_hline(data = grad_df, aes(yintercept = yintercept, alpha = alpha), 
+             size = 2.5, colour = "white") + 
+  geom_line(data = spline_df, aes(x = x, y = y), colour = "#565656", size = 1.0) + 
+  geom_point(aes(x = Structure_numeric, y = normalized_value), shape = 16, size = 3.5, colour = "#565656") + 
+  geom_point(aes(x = Structure_numeric, y = normalized_value), shape = 16, size = 1.5, colour = "white") + 
+  theme_classic() +
+  custom_theme_r()+
+  # theme(
+  #   panel.grid.major.x = element_blank(),
+  #   panel.grid.minor = element_blank(),
+  #   panel.border = element_blank(),
+  #   axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+  #   axis.title.y = element_text(size = 10),
+  #   axis.ticks = element_blank(),
+  #   axis.line = element_line(linewidth = 0.08),
+  #   axis.text.y = element_text(size = 7, margin = margin(0, 2, 0, 0, unit = "pt"))
+  # ) +
+  scale_alpha_identity() + 
+  labs(x = NULL, y = "Hub score (% Baseline)", title = "Wt") +
+  scale_y_continuous(expand = c(0, 0)) + 
+  #coord_cartesian(ylim = c(20, max(spline_df$y) * 1.1)) +  # Apply visual cutoff without removing data
+  coord_cartesian(ylim = c(20, 130)) +
+  scale_x_continuous(
+    breaks = data_hubscore_unilateral_filtered$Structure_numeric,
+    labels = data_hubscore_unilateral_filtered$Structure
+  )
+# Test ______________________________
+
+# Prepare data with numeric conversion for Structure
+data_hubscore_unilateral_filtered <- data_hubscore_unilateral %>%
+  filter(Bin == "T4", Group == "TetTag") %>%
+  group_by(Structure) %>%
+  reframe(normalized_value = mean(normalized_value, na.rm = TRUE)) %>%
+  arrange(desc(normalized_value)) %>%
+  mutate(Structure_numeric = as.numeric(factor(Structure, levels = unique(Structure))))
+
+# Interpolate the line to create a smooth curve without filtering out values
+spline_df <- as.data.frame(spline(data_hubscore_unilateral_filtered$Structure_numeric, 
+                                  data_hubscore_unilateral_filtered$normalized_value, 
+                                  n = 200, method = "hyman"))
+
+# Prepare gradient data frame to create gradient effect
+grad_df <- data.frame(
+  yintercept = seq(0, max(spline_df$y), length.out = 200),
+  alpha = seq(0.2, 0, length.out = 200)
+)
+
+# Plotting with coord_cartesian to limit y-axis without filtering data
+p_hubrank_test <- ggplot(data_hubscore_unilateral_filtered, aes(x = Structure_numeric, y = normalized_value)) + 
+  geom_area(data = spline_df, aes(x = x, y = y), fill = "#4169E1", alpha = 0.35) + 
+  geom_hline(data = grad_df, aes(yintercept = yintercept, alpha = alpha), 
+             size = 2.5, colour = "white") + 
+  geom_line(data = spline_df, aes(x = x, y = y), colour = "#4169E1", size = 1.0) + 
+  geom_point(aes(x = Structure_numeric, y = normalized_value), shape = 16, size = 3.5, colour = "#4169E1") + 
+  geom_point(aes(x = Structure_numeric, y = normalized_value), shape = 16, size = 1.5, colour = "white") + 
+  theme_classic() +
+  custom_theme_r()+
+  # theme(
+  #   panel.grid.major.x = element_blank(),
+  #   panel.grid.minor = element_blank(),
+  #   panel.border = element_blank(),
+  #   axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+  #   axis.title.y = element_text(size = 10),
+  #   axis.ticks = element_blank(),
+  #   axis.line = element_line(linewidth = 0.08),
+  #   axis.text.y = element_text(size = 7, margin = margin(0, 2, 0, 0, unit = "pt"))
+  # ) +
+  scale_alpha_identity() + 
+  labs(x = NULL, y = "Hub score (% Baseline)", title = "TetTag-hM3Dq") +
+  scale_y_continuous(expand = c(0, 0)) + 
+  # coord_cartesian(ylim = c(20, max(spline_df$y) * 1.1)) +  # Apply visual cutoff without removing data
+  coord_cartesian(ylim = c(20, 130)) +
+  scale_x_continuous(
+    breaks = data_hubscore_unilateral_filtered$Structure_numeric,
+    labels = data_hubscore_unilateral_filtered$Structure)
+
+```
+
+
+## T1-4 nodal
+```{r}
+## Unilateral ##################################################################
+set.seed(123)
+nodalresults_list_no_structure <- setNames(
+  lapply(centrality_measures, function(measure) {
+    process_centrality_measure_no_structure(
+      centrality_data = centrality_data,
+      target_measure = measure,
+      bin_levels = bin_levels,
+      boot_mean_diff_no_structure = boot_mean_diff_no_structure
+    )
+  }),
+  centrality_measures
+)
+
+mean_se <- function(x) {
+  mean_val <- mean(x, na.rm = TRUE)
+  se_val <- sd(x, na.rm = TRUE) / sqrt(length(na.omit(x)))
+  data.frame(y = mean_val, ymin = mean_val - se_val, ymax = mean_val + se_val)
+}
+
+
+# Access the results
+data_degree_no_structure <- nodalresults_list_no_structure$Degree$data_normalized
+bootstrap_degree_no_structure <- nodalresults_list_no_structure$Degree$bootstrap_results
+data_summary_degree_no_structure <- nodalresults_list_no_structure$Degree$data_summary
+annotations_degree_no_structure <- nodalresults_list_no_structure$Degree$annotations
+
+data_hub_no_structure <- nodalresults_list_no_structure$Hub_score$data_normalized
+bootstrap_hub_no_structure <- nodalresults_list_no_structure$Hub_score$bootstrap_results
+data_summary_hub_no_structure <- nodalresults_list_no_structure$Hub_score$data_summary
+annotations_hub_no_structure <- nodalresults_list_no_structure$Hub_score$annotations
+
+data_efficiency_no_structure <- nodalresults_list_no_structure$Nodal_efficiency$data_normalized
+bootstrap_efficiency_no_structure <- nodalresults_list_no_structure$Nodal_efficiency$bootstrap_results
+data_summary_efficiency_no_structure <- nodalresults_list_no_structure$Nodal_efficiency$data_summary
+annotations_efficiency_no_structure <- nodalresults_list_no_structure$Nodal_efficiency$annotations
+
+data_transitivity_no_structure <- nodalresults_list_no_structure$Transitivity$data_normalized
+bootstrap_transitivity_no_structure <- nodalresults_list_no_structure$Transitivity$bootstrap_results
+data_summary_transitivity_no_structure <- nodalresults_list_no_structure$Transitivity$data_summary
+annotations_transitivity_no_structure <- nodalresults_list_no_structure$Transitivity$annotations
+
+data_harmonic_no_structure <- nodalresults_list_no_structure$Harmonic_Centrality$data_normalized
+bootstrap_harmonic_no_structure <- nodalresults_list_no_structure$Harmonic_Centrality$bootstrap_results
+data_summary_harmonic_no_structure <- nodalresults_list_no_structure$Harmonic_Centrality$data_summary
+annotations_harmonic_no_structure <- nodalresults_list_no_structure$Harmonic_Centrality$annotations
+
+data_closeness_no_structure <- nodalresults_list_no_structure$Closeness$data_normalized
+bootstrap_closeness_no_structure <- nodalresults_list_no_structure$Closeness$bootstrap_results
+data_summary_closeness_no_structure <- nodalresults_list_no_structure$Closeness$data_summary
+annotations_closeness_no_structure <- nodalresults_list_no_structure$Closeness$annotations
+
+data_strength_no_structure <- nodalresults_list_no_structure$Strength$data_normalized
+bootstrap_strength_no_structure <- nodalresults_list_no_structure$Strength$bootstrap_results
+data_summary_strength_no_structure <- nodalresults_list_no_structure$Strength$data_summary
+annotations_strength_no_structure <- nodalresults_list_no_structure$Strength$annotations
+
+
+### Hub score  #######################################################
+p_hub <- data_hub_no_structure %>%
+  ggplot(aes(x = Bin, y = normalized_value, fill = Group, group = Group)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black") +
+  geom_line(data = data_hub_no_structure %>%
+    group_by(Group, Bin) %>%
+    reframe(normalized_value = mean(normalized_value)),
+    aes(color = Group), size = 0.7, stat = "smooth",  method='ggpchip', se=F)+
+  #stat_summary(aes(color = Group), fun = mean, geom = "line", size = 0.6, alpha = 0.8)+
+  stat_summary(fun = mean, geom = "point", shape = 21, size = 2.5, color = "black") +
+  geom_text(data = annotations_hub_no_structure,
+            aes(x = Bin, y = c(105,103), label = p_signif),
+            inherit.aes = FALSE,  size = 5) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)),
+    limits = function(x) c(min(x) * 0.99, max(x) * 1.01))+  
+  theme_classic() +
+  custom_theme_nodal() +
+  theme(axis.text.x = element_text(size = 7))+
+  labs(
+    x = NULL,
+    y = "Hub score"
+  ) +
+  scale_fill_manual(values = palette1)+
+  scale_color_manual(values = palette1)
+
+
+```
+
+
+## T4 global
+
+```{r}
+# process_global_centrality_measures <- function(
+#     globalcentrality_data,
+#     bin_levels = c("T1", "T2", "T3", "T4"),
+#     boot_mean_diff_func,
+#     some_offset = 5  # Adjust based on your data scale
+# ) {
+#   
+#   # Prepare the data
+#   bootstrap_data <- globalcentrality_data %>%
+#     pivot_longer(
+#       cols = 1:9,  # Adjust this range based on your data
+#       names_to = "Centrality",
+#       values_to = "value"
+#     ) %>%
+#     group_by(Group, Centrality) %>%
+#     mutate(
+#       S1_value = mean(value[Bin == "T1"], na.rm = TRUE),
+#       normalized_value = (value / S1_value) * 100
+#     ) %>%
+#     ungroup() %>%
+#     filter(Bin != "T5") %>%
+#     mutate(Bin = factor(Bin, levels = bin_levels))
+#   
+#   # Define the bootstrap function if not provided
+#   if (missing(boot_mean_diff_func)) {
+#     boot_mean_diff_func <- function(data, indices) {
+#   d <- data[indices, ]  # Resample the data
+#   
+#   if (sum(d$Group == "Wt") == 0 || sum(d$Group == "TetTag") == 0) {
+#   return(NA)
+# }
+# 
+# mean_CTRL <- mean(d$normalized_value[d$Group == "Wt"], na.rm = TRUE)
+# mean_TEST <- mean(d$normalized_value[d$Group == "TetTag"], na.rm = TRUE)
+# 
+#   return(mean_TEST - mean_CTRL)  # Return the difference in means
+#   }
+# 
+#   }
+#   
+#   # For each Bin and Centrality, perform bootstrapping
+#   bootstrap_results <- bootstrap_data %>%
+#     group_by(Bin, Centrality) %>%
+#     nest() %>%
+#     mutate(
+#       boot_out = map(data, ~ boot(
+#         data = .x,
+#         statistic = boot_mean_diff_func,
+#         R = 1000
+#       ))
+#     ) %>%
+#     # Extract confidence intervals at different levels
+#     mutate(
+#       ci_95 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.95)),
+#       ci_99 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.99)),
+#       ci_999 = map(boot_out, ~ boot.ci(.x, type = "bca", conf = 0.999)),
+#       # Extract lower and upper bounds of the confidence intervals
+#       ci_95_lower = map_dbl(ci_95, ~ .x$bca[4]),
+#       ci_95_upper = map_dbl(ci_95, ~ .x$bca[5]),
+#       ci_99_lower = map_dbl(ci_99, ~ .x$bca[4]),
+#       ci_99_upper = map_dbl(ci_99, ~ .x$bca[5]),
+#       ci_999_lower = map_dbl(ci_999, ~ .x$bca[4]),
+#       ci_999_upper = map_dbl(ci_999, ~ .x$bca[5]),
+#       # Assign significance levels
+#       p_signif = case_when(
+#         (ci_999_lower > 0 & ci_999_upper > 0) | (ci_999_lower < 0 & ci_999_upper < 0) ~ "***",
+#         (ci_99_lower > 0 & ci_99_upper > 0) | (ci_99_lower < 0 & ci_99_upper < 0) ~ "**",
+#         (ci_95_lower > 0 & ci_95_upper > 0) | (ci_95_lower < 0 & ci_95_upper < 0) ~ "*",
+#         TRUE ~ "ns"
+#       )
+#     )
+#   
+#   # Prepare the plot data
+#   plot_data_global_boot <- bootstrap_data %>%
+#     group_by(Group, Bin, Centrality) %>%
+#     summarise(
+#       average = mean(normalized_value, na.rm = TRUE),
+#       sd = sd(normalized_value, na.rm = TRUE),
+#       sem = sd / sqrt(n()),
+#       .groups = "drop"
+#     ) %>%
+#     mutate(Bin = factor(Bin, levels = bin_levels))
+#   
+#   # Calculate y.position for annotations
+#   max_y_positions <- plot_data_global_boot %>%
+#     mutate(y_max = average + sem) %>%
+#     group_by(Bin, Centrality) %>%
+#     summarise(y.position = max(y_max, na.rm = TRUE) + some_offset, .groups = "drop")
+#   
+#   # Prepare annotations
+#   annotations <- bootstrap_results %>%
+#     dplyr::select(Bin, Centrality, p_signif) %>%
+#     left_join(max_y_positions, by = c("Bin", "Centrality")) %>%
+#     filter(p_signif != "ns") %>%
+#     mutate(Bin = factor(Bin, levels = bin_levels))
+#   
+#   # Return results as a list
+#   list(
+#     bootstrap_data = bootstrap_data,
+#     bootstrap_results = bootstrap_results,
+#     plot_data_global_boot = plot_data_global_boot,
+#     annotations = annotations
+#   )
+# }
+
+
+# Process Global centrality measures ###########################################
+globalcentrality_measures <- globalcentrality_data %>% dplyr::select(1:10) %>% colnames()
+
+globalcentrality_data <- globalcentrality_data %>%
+  mutate(Group = dplyr::recode(Group, "CTRL" = "Wt", "TEST" = "TetTag"),
+         Bin = dplyr::recode(Bin, "S1" = "T1", "S2" = "T2", "S3" = "T3", "S4" = "T4", "S5" = "T5"))
+
+globalcentrality_data$Group <- factor(globalcentrality_data$Group, levels = c("Wt", "TetTag") )
+
+
+globalcentrality_data <- globalcentrality_data %>% filter(Bin != "T5") 
+
+
+result_global_centrality <- process_global_centrality_measures(
+  globalcentrality_data = globalcentrality_data,
+  bin_levels = c("T1", "T2", "T3", "T4"),
+  some_offset = 5  # Adjust this value based on your data scale
+)
+
+
+# Plots
+# Global efficiency
+p_eff <- result_global_centrality$plot_data_global_boot %>%
+  filter(Centrality == "Global_efficiency") %>%
+  ggplot(aes(x = Bin, y = average, color = Group, group = Group)) +
+  geom_errorbar(aes(ymin = average - sem, ymax = average + sem), width = 0.2, color = "black") +
+  geom_line(aes(color = Group), size = 0.7, stat = "smooth",  method='ggpchip', se=F)+
+  geom_point(aes(fill = Group), shape = 21, size = 2.5, color = "black") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  geom_text(
+    data = result_global_centrality$annotations %>% filter(Centrality == "Global_efficiency") ,
+    aes(x = Bin, y = y.position, label = p_signif),
+    inherit.aes = FALSE,
+    size = 5,
+    vjust = 0.5
+  ) +
+  theme_classic()+
+  custom_theme_nodal() +
+  theme(axis.text.x = element_text(size = 7))+
+  scale_color_manual(values = palette1)+
+  scale_fill_manual(values = palette1)+
+  labs(x = NULL, y = "Global efficiency")
+
+# Edge density
+p_edge <- result_global_centrality$plot_data_global_boot %>%
+  filter(Centrality == "Edge_density") %>%
+  ggplot(aes(x = Bin, y = average, color = Group, group = Group)) +
+  #geom_line(size = 0.6, alpha = 0.8) +
+  geom_line(aes(color = Group), size = 0.7, stat = "smooth",  method='ggpchip', se=F)+
+  geom_errorbar(aes(ymin = average - sem, ymax = average + sem), width = 0.2, color = "black") +
+  geom_point(aes(fill = Group), shape = 21, size = 2.5, color = "black") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  geom_text(
+    data = result_global_centrality$annotations %>% filter(Centrality == "Edge_density") ,
+    aes(x = Bin, y = y.position, label = p_signif),
+    inherit.aes = FALSE,
+    size = 5,
+    vjust = 0.5) +
+  theme_classic()+
+  custom_theme_nodal() +
+  theme(axis.text.x = element_text(size = 7))+
+  scale_color_manual(values = palette1)+
+  scale_fill_manual(values = palette1)+
+  labs(x = NULL, y = "Edge density ")
+
+# Average transitivity
+p_cluster <- result_global_centrality$plot_data_global_boot %>%
+  filter(Centrality == "Average_transitivity") %>%
+  ggplot(aes(x = Bin, y = average, color = Group, group = Group)) +
+  #geom_line(size = 0.6, alpha = 0.8) +
+  geom_line(aes(color = Group), size = 0.7, stat = "smooth",  method='ggpchip', se=F)+
+  geom_errorbar(aes(ymin = average - sem, ymax = average + sem), width = 0.2, color = "black") +
+  geom_point(aes(fill = Group), shape = 21, size = 2.5, color = "black") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  # Add significance annotations
+  geom_text(
+    data = result_global_centrality$annotations %>% filter(Centrality == "Average_transitivity") ,
+    aes(x = Bin, y = y.position, label = p_signif),
+    inherit.aes = FALSE,
+    size = 5,
+    vjust = 0.5
+  ) +
+  theme_classic()+
+  custom_theme_nodal() +
+  theme(axis.text.x = element_text(size = 7))+
+  scale_color_manual(values = palette1)+
+  scale_fill_manual(values = palette1)+
+  labs(x = NULL, y = "Clustering coeff")
+```
+
+## Centrality panels
+```{r}
+library(patchwork)
+
+# 5 x 5
+left_column <- p_eff + p_edge + p_cluster + p_hub +
+  plot_layout(nrow = 1, guides = "collect") &
+  theme(legend.position = "bottom")
+
+(left_column / p_hub_nodes) + plot_layout(heights = c(1, 3))
+
+```
+
+
+# Behavior vs Hub score
+
+```{r}
+# Hub score #########################
+performance_ext <- Behavior %>%
+  filter(Block_10 == "14") %>%
+  group_by(Group, ID) %>%
+    reframe(Correct = mean(Correct)) %>%
+  mutate(ID = str_remove(ID, "#"))
+
+data_combined <- data_hubscore_unilateral %>%
+  mutate(Group = dplyr::recode(Group, "Wt" = "Control", "TetTag" = "DREADD")) %>%
+  filter(Bin == "T4") %>%  
+  inner_join(performance_ext, by = c("ID", "Group"))
+
+data_combined <- data_combined %>%
+  mutate(Group = dplyr::recode(Group, "Control" = "Wt", "DREADD" = "TetTag"))
+
+data_combined$Group <- factor(data_combined$Group, levels = c("Wt", "TetTag"))
+
+data_combined %>%
+  group_by(Structure) %>%
+  reframe(
+    correlation = cor(Correct, normalized_value, use = "complete.obs", method = "pearson"),
+    p_value = cor.test(Correct, normalized_value, method = "pearson")$p.value
+  ) %>%
+  arrange(desc(abs(correlation))) 
+
+data_combined %>%
+  group_by(Structure) %>%
+  cor_test(Correct, normalized_value, method = "pearson") %>%
+  filter(p < 0.05)
+
+top_structures <- c("dCA1", "dCA3", "dDG", "aACC", "pACC", "iRSP", "PVT")
+data_top <- data_combined %>%
+  filter(Structure %in% top_structures)
+
+data_top$Structure <- factor(data_top$Structure, levels = c("dCA1", "dCA3", "dDG", "PVT","aACC",  
+                                                            "pACC", "iRSP"))
+
+p_hubcorr <- ggplot(data_top, aes(x = Correct, y = normalized_value, fill = Group)) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", fill = "black", size = 0.6) +
+  geom_point(shape = 21, size = 1.5) +
+  facet_wrap(~ Structure, scales = "free", nrow = 1) +
+  labs(
+    #title = "Hub Score vs Performance",
+    x = "Performance (Late extinction)",
+    y = "Hub Score"
+  ) +
+  theme_classic()+
+  custom_theme_r()+
+  theme(axis.title.x = element_text(size = 8))+
+  scale_fill_manual(values = palette1)
+
+#4x7
+grid.arrange(p_hubcorr, heights = unit(5, "cm") )
+  
+```
+
+## Minimal network
+
+```{r}
+top_structures_positive <- c("dCA1", "dDG", "dCA3") 
+top_structures_combined <- unique(top_structures_positive)
+
+
+# Get the vertices that match the target names
+target_vertices <- V(g_TEST_S4)[name %in% top_structures_combined]
+
+
+# Find all neighbors of the target vertices
+neighbor_vertices <- neighbors(g_TEST_S4, target_vertices, mode = "all")
+
+# Combine target vertices and their neighbors
+vertices_to_keep <- union(target_vertices, neighbor_vertices)
+
+# Induce the subgraph with the selected vertices
+sub_g <- induced_subgraph(g_TEST_S4, vids = vertices_to_keep)
+
+set.seed(123)
+comm_minimal <- cluster_louvain(sub_g)
+
+# 4 x 4
+set.seed(123)
+p_gminimal <- ggraph(sub_g, layout = layout_with_fr(sub_g)) +
+  geom_mark_hull(aes(x = x, y = y,
+                     fill = factor(membership(comm_minimal)), 
+                     anchors = NULL), color = "white", concavity = 8, alpha = 0.2, show.legend = F) +
+  scale_fill_d3(name = "Communities") +
+  ggnewscale::new_scale_fill()+
+  geom_edge_link0(aes(edge_colour = weight, edge_width = weight, alpha = weight)) +
+  geom_node_point(aes(fill = hub_score(sub_g)$vector, size = hub_score(sub_g)$vector),shape = 21) +
+  geom_shadowtext(aes(x = x, y = y, label = name), size = 2.5, fontface="bold", repel = TRUE, color = "white", bg.colour='black')+
+  # geom_text(aes(x = x, y = y, label = name),
+  #         size = 2.5, fontface = "bold", color = "black")+
+  scale_edge_color_continuous(low = "#d1d1d1", high = "black", name = "Weight") +
+  scale_fill_viridis(name = "Hub score", option = "H")+
+  scale_edge_width(range = c(0.1, 2), name = "Weight") +
+  scale_size(range = c(6, 10), name = "Hub score") +
+  theme_void()+
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 9)
+  )+
+  guides(#size= guide_legend("Degree"), 
+    #fill = FALSE, 
+    size = FALSE,
+    color = FALSE, 
+    apha = FALSE,
+    #edge_colour = FALSE, 
+    width = FALSE,
+    edge_width = FALSE)
+
+# Ranks _________________________________
+
+# Hub score
+data_hubscore_minimal <- data.frame(Hub_score = hub_score(sub_g)$vector) %>%
+  rownames_to_column(var = "Structure") %>%
+  arrange(desc(Hub_score)) %>%
+  mutate(Structure_numeric = as.numeric(factor(Structure, levels = unique(Structure))))
+
+spline_df <- as.data.frame(spline(data_hubscore_minimal$Structure_numeric, 
+                                  data_hubscore_minimal$Hub_score, 
+                                  n = 200, method = "hyman"))
+
+grad_df <- data.frame(
+  yintercept = seq(0, max(spline_df$y), length.out = 200),
+  alpha = seq(0.2, 0, length.out = 200))
+
+p_minimal_hub <- ggplot(data_hubscore_minimal, aes(x = Structure_numeric, y = Hub_score)) + 
+  geom_area(data = spline_df, aes(x = x, y = y), fill = "#4169E1", alpha = 0.35) + 
+  geom_hline(data = grad_df, aes(yintercept = yintercept, alpha = alpha), 
+             size = 2.5, colour = "white") + 
+  geom_line(data = spline_df, aes(x = x, y = y), colour = "#4169E1", size = 1.0) + 
+  geom_point(aes(x = Structure_numeric, y = Hub_score), shape = 16, size = 3.5, colour = "#4169E1") + 
+  geom_point(aes(x = Structure_numeric, y = Hub_score), shape = 16, size = 1.5, colour = "white") + 
+  theme_classic() +
+  custom_theme_r()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.ticks.y.left = element_line(color = "black", size = 0.2),
+        axis.ticks.x.bottom = element_line(color = "black", size = 0.2))+
+  scale_alpha_identity() + 
+  labs(x = NULL, y = "Hub score") +
+  #scale_y_continuous(expand = c(0, 0.05)) + 
+  coord_cartesian(ylim = c(0.4, max(spline_df$y) * 1.01)) +  # Apply visual cutoff without removing data
+  #coord_cartesian(ylim = c(20, 130)) +
+  scale_x_continuous(
+    breaks = data_hubscore_minimal$Structure_numeric,
+    labels = data_hubscore_minimal$Structure)
+
+# Closeness
+
+centrality_minimal <- get_centrality_measures(sub_g, weighted = TRUE)
+
+data_closeness_minimal <- data.frame(
+  Closeness = centrality_minimal$closeness) %>%
+  rownames_to_column(var = "Structure") %>%
+  arrange(desc(Closeness)) %>%
+  mutate(Structure_numeric = as.numeric(factor(Structure, levels = unique(Structure))))
+
+data_closeness_minimal <- data.frame(
+  Structure = rownames(centrality_minimal),
+  Closeness = centrality_minimal$closeness
+) %>%
+  arrange(desc(Closeness)) %>%
+  mutate(Structure_numeric = row_number())
+
+spline_df <- as.data.frame(spline(data_closeness_minimal$Structure_numeric, 
+                                  data_closeness_minimal$Closeness, 
+                                  n = 200, method = "hyman"))
+
+grad_df <- data.frame(
+  yintercept = seq(0, max(spline_df$y), length.out = 200),
+  alpha = seq(0.2, 0, length.out = 200))
+
+p_minimal_close <- ggplot(data_closeness_minimal, aes(x = Structure_numeric, y = Closeness)) + 
+  geom_area(data = spline_df, aes(x = x, y = y), fill = "#4169E1", alpha = 0.35) + 
+  geom_hline(data = grad_df, aes(yintercept = yintercept, alpha = alpha), 
+             size = 2.5, colour = "white") + 
+  geom_line(data = spline_df, aes(x = x, y = y), colour = "#4169E1", size = 1.0) + 
+  geom_point(aes(x = Structure_numeric, y = Closeness), shape = 16, size = 3.5, colour = "#4169E1") + 
+  geom_point(aes(x = Structure_numeric, y = Closeness), shape = 16, size = 1.5, colour = "white") + 
+  theme_classic() +
+  custom_theme_r()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.ticks.y.left = element_line(color = "black", size = 0.2),
+        axis.ticks.x.bottom = element_line(color = "black", size = 0.2))+
+  scale_alpha_identity() + 
+  labs(x = NULL, y = "Closeness") +
+  #scale_y_continuous(expand = c(0, 0.05)) + 
+  coord_cartesian(ylim = c(0.2, max(spline_df$y) * 1.01)) +  # Apply visual cutoff without removing data
+  #coord_cartesian(ylim = c(20, 130)) +
+  scale_x_continuous(
+    breaks = data_closeness_minimal$Structure_numeric,
+    labels = data_closeness_minimal$Structure)
+
+# Betweenness
+data_betweenness_minimal <- data.frame(
+  Betweenness = centrality_minimal$betweenness) %>%
+  rownames_to_column(var = "Structure") %>%
+  arrange(desc(Betweenness)) %>%
+  mutate(Structure_numeric = as.numeric(factor(Structure, levels = unique(Structure))))
+
+data_betweenness_minimal <- data.frame(
+  Structure = rownames(centrality_minimal),
+    Betweenness = centrality_minimal$betweenness
+) %>%
+  arrange(desc(Betweenness)) %>%
+  mutate(Structure_numeric = row_number())
+
+spline_df <- as.data.frame(spline(data_betweenness_minimal$Structure_numeric, 
+                                  data_betweenness_minimal$Betweenness, 
+                                  n = 200, method = "hyman"))
+
+grad_df <- data.frame(
+  yintercept = seq(0, max(spline_df$y), length.out = 200),
+  alpha = seq(0.2, 0, length.out = 200))
+
+p_minimal_bet <- ggplot(data_betweenness_minimal, aes(x = Structure_numeric, y = Betweenness)) + 
+  geom_area(data = spline_df, aes(x = x, y = y), fill = "#4169E1", alpha = 0.35) + 
+  geom_hline(data = grad_df, aes(yintercept = yintercept, alpha = alpha), 
+             size = 2.5, colour = "white") + 
+  geom_line(data = spline_df, aes(x = x, y = y), colour = "#4169E1", size = 1.0) + 
+  geom_point(aes(x = Structure_numeric, y = Betweenness), shape = 16, size = 3.5, colour = "#4169E1") + 
+  geom_point(aes(x = Structure_numeric, y = Betweenness), shape = 16, size = 1.5, colour = "white") + 
+  theme_classic() +
+  custom_theme_r()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.ticks.y.left = element_line(color = "black", size = 0.2),
+        axis.ticks.x.bottom = element_line(color = "black", size = 0.2))+
+  scale_alpha_identity() + 
+  labs(x = NULL, y = "Betweenness") +
+  scale_y_continuous(expand = c(0, 0.05)) + 
+  # coord_cartesian(ylim = c(20, max(spline_df$y) * 1.1)) +  # Apply visual cutoff without removing data
+  #coord_cartesian(ylim = c(20, 130)) +
+  scale_x_continuous(
+    breaks = data_betweenness_minimal$Structure_numeric,
+    labels = data_betweenness_minimal$Structure)
+
+# 4 x 4
+p_minimalcent <- grid.arrange(p_minimal_hub, p_minimal_close, p_minimal_bet)
+
+## Panels
+# 3 x 7
+grid.arrange(p_gminimal, p_minimalcent, ncol  = 2 )
+  
+```
+.
+
+# Diversity (communities)
+
+```{r}
+# Function to calculate Shannon entropy
+shannon_entropy <- function(probs) {
+  -sum(probs * log(probs), na.rm = TRUE)
+}
+
+# Function to calculate label diversity for a graph and return a dataframe
+calculate_community_diversity <- function(graph, group_name) {
+  # Ensure the 'community' and 'label' attributes are vectors
+  communities <- as.vector(V(graph)$community)
+  labels <- as.vector(V(graph)$Region)
+  
+  # Calculate the community diversity for each node
+  community_diversity <- sapply(V(graph), function(v) {
+    neighbors <- neighbors(graph, v)                    # Get the neighbors of the node
+    neighbor_communities <- communities[neighbors]      # Get the communities of the neighbors
+    community_table <- table(neighbor_communities)      # Count the occurrences of each community
+    probs <- community_table / sum(community_table)     # Convert counts to probabilities
+    shannon_entropy(probs)                              # Calculate Shannon entropy as diversity
+  })
+  
+  # Create a dataframe with the results
+  data.frame(
+    Group = group_name,
+    Structure = V(graph)$name,         # Node names
+    Region = labels,                    # Node labels
+    Community = communities,           # Node community (ensure it's a vector)
+    Diversity = community_diversity    # Diversity values
+  )
+}
+
+# Calculate label diversity for each graph
+df_comm_ctrl <- calculate_community_diversity(g_CTRL_S4, "Wt")
+df_comm_test <- calculate_community_diversity(g_TEST_S4, "TetTag-hM3Dq")
+
+community_diversity_df  <- bind_rows(df_comm_ctrl, df_comm_test)
+
+community_diversity_df$Group <- factor(community_diversity_df$Group, levels = c("Wt", "TetTag-hM3Dq"))
+
+# Plot
+stat.test <- community_diversity_df  %>% 
+  #group_by(Region) %>%
+  wilcox_test(Diversity ~ Group)
+stat.test <- add_xy_position(stat.test, fun = "max")
+stat.test <- add_significance(stat.test)
+
+# 3 x 6
+p_comm_diversity <- community_diversity_df  %>%
+  ggplot(aes(x = Group, y = Diversity))+
+  geom_violin(aes(fill = Group), alpha = 0.7, linewidth = 0.2, trim = F)+
+  geom_boxplot(width = 0.15, alpha = 1, linewidth = 0.3, outliers = F, show.legend = FALSE, fill = "white", color = "black")+
+  geom_line(aes(group = Structure), alpha = 0.2)+
+  #custom_theme_centrality_structures()+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_manual(values = palette1)+
+  labs(x = "Diversity", y = NULL, title = "Diversity - communities")+
+  theme_classic() +
+  custom_theme_nodal() +
+  #facet_wrap(~Region, scales = "free", strip.position="left")+
+  stat_pvalue_manual(
+    stat.test, 
+    step.increase = 0,
+    label = "p.signif",
+    hide.ns = TRUE, 
+    size = 6,
+    tip.length = 0.0)
+```
+# Participation
+```{r}
+
+# Using Diversity
+df <- community_diversity_df %>% select(Group, Structure, Diversity)
+
+df_CTRL_participation <- data.frame(
+  node = V(g_CTRL_S4)$name,
+  participation_coeff = participation.coeff(g_CTRL_S4, comm_ctrl),
+  hub_score = eigen_centrality(g_CTRL_S4)$vector,
+  Diversity = df %>% filter(Group == "Wt") %>% pull(Diversity)
+)
+
+df_TEST_participation <- data.frame(
+  node = V(g_TEST_S4)$name,
+  participation_coeff = participation.coeff(g_TEST_S4, comm_test),
+  hub_score = eigen_centrality(g_TEST_S4)$vector,
+  Diversity = df %>% filter(Group == "TetTag-hM3Dq") %>% pull(Diversity)
+)
+
+centrality_threshold <- quantile(df_CTRL_participation$hub_score, 0.80)
+diversity_threshold <-quantile(df_CTRL_participation$Diversity, 0.80)
+
+df_CTRL_participation <- df_CTRL_participation %>%
+  mutate(
+    role = case_when(
+      hub_score >= centrality_threshold & Diversity >= diversity_threshold ~ "Connector Hub",
+      hub_score >= centrality_threshold & Diversity < diversity_threshold ~ "Provincial Hub",
+      hub_score < centrality_threshold & Diversity >= diversity_threshold ~ "Non-Hub Connector",
+      TRUE ~ "Peripheral Node"
+    )
+  )
+
+centrality_threshold <- quantile(df_TEST_participation$hub_score, 0.80)
+diversity_threshold <-quantile(df_TEST_participation$Diversity, 0.80)
+df_TEST_participation <- df_TEST_participation %>%
+  mutate(
+    role = case_when(
+      hub_score >= centrality_threshold & Diversity >= diversity_threshold ~ "Connector Hub",
+      hub_score >= centrality_threshold & Diversity < diversity_threshold ~ "Provincial Hub",
+      hub_score < centrality_threshold & Diversity >= diversity_threshold ~ "Non-Hub Connector",
+      TRUE ~ "Peripheral Node"
+    )
+  )
+
+
+
+# Test ______________________________
+
+# Prepare data with numeric conversion for Structure
+df_TEST_participation <- df_TEST_participation %>%
+  arrange(desc(Diversity)) %>%
+  mutate(node_numeric = as.numeric(factor(node, levels = unique(node))))
+
+# Interpolate the line to create a smooth curve without filtering out values
+spline_df <- as.data.frame(spline(df_TEST_participation$node_numeric, 
+                                  df_TEST_participation$Diversity, 
+                                  n = 200, method = "hyman"))
+
+# Prepare gradient data frame to create gradient effect
+grad_df <- data.frame(
+  yintercept = seq(0, max(spline_df$y), length.out = 200),
+  alpha = seq(0.2, 0, length.out = 200)
+)
+
+df_TEST_participation$role <- factor(df_TEST_participation$role, levels = c(
+  "Connector Hub", "Provincial Hub", "Non-Hub Connector", "Peripheral Node"
+))
+
+
+p_role_test <- ggplot(df_TEST_participation, aes(x = node_numeric, y = Diversity)) + 
+  geom_area(data = spline_df, aes(x = x, y = y), fill = "#4169E1", alpha = 0.35) + 
+  geom_hline(data = grad_df, aes(yintercept = yintercept, alpha = alpha), 
+             size = 2.5, colour = "white") + 
+  geom_line(data = spline_df, aes(x = x, y = y), colour = "#4169E1", size = 1.0) + 
+  geom_point(aes(x = node_numeric, y = Diversity, color = role), shape = 16, size = 3.5) + 
+  geom_point(aes(x = node_numeric, y = Diversity), shape = 16, size = 1.5, color = "white") + 
+  geom_col(aes(y = hub_score), fill = "white", color = "grey", alpha = 0.5)+
+  theme_classic() +
+  custom_theme_r()+
+  scale_color_npg()+
+  scale_alpha_identity() + 
+  labs(x = NULL, y = "Hub score (Bar) / Diversity (Line)"#, title = "TetTag-hM3Dq"
+       ) +
+  scale_y_continuous(expand = c(0, 0)) + 
+  # coord_cartesian(ylim = c(20, max(spline_df$y) * 1.1)) +  # Apply visual cutoff without removing data
+  #coord_cartesian(ylim = c(20, 130)) +
+  scale_x_continuous(
+    breaks = df_TEST_participation$node_numeric,
+    labels = df_TEST_participation$node)+
+  coord_flip()+
+  theme(axis.text.y = element_text(size = 8))
+
+# Ctrl ______________________________
+
+# Prepare data with numeric conversion for Structure
+df_CTRL_participation <- df_CTRL_participation %>%
+  arrange(desc(Diversity)) %>%
+  mutate(node_numeric = as.numeric(factor(node, levels = unique(node))))
+
+# Interpolate the line to create a smooth curve without filtering out values
+spline_df <- as.data.frame(spline(df_CTRL_participation$node_numeric, 
+                                  df_CTRL_participation$Diversity, 
+                                  n = 200, method = "hyman"))
+
+# Prepare gradient data frame to create gradient effect
+grad_df <- data.frame(
+  yintercept = seq(0, max(spline_df$y), length.out = 200),
+  alpha = seq(0.2, 0, length.out = 200)
+)
+
+df_CTRL_participation$role <- factor(df_CTRL_participation$role, levels = c(
+  "Connector Hub", "Provincial Hub", "Non-Hub Connector", "Peripheral Node"
+))
+
+p_role_ctrl <- ggplot(df_CTRL_participation, aes(x = node_numeric, y = Diversity)) + 
+  geom_area(data = spline_df, aes(x = x, y = y), fill = "#8C92AC", alpha = 0.35) + 
+  geom_hline(data = grad_df, aes(yintercept = yintercept, alpha = alpha), 
+             size = 2.5, colour = "white") + 
+  geom_line(data = spline_df, aes(x = x, y = y), colour = "#8C92AC", size = 1.0) + 
+  geom_point(aes(x = node_numeric, y = Diversity, color = role), shape = 16, size = 3.5) + 
+  geom_point(aes(x = node_numeric, y = Diversity), shape = 16, size = 1.5, color = "white") + 
+  geom_col(aes(y = hub_score), fill = "white", color = "grey", alpha = 0.5)+
+  theme_classic() +
+  custom_theme_r()+
+  scale_color_npg()+
+  scale_alpha_identity() + 
+  labs(x = NULL, y = "Hub score (Bar) / Diversity (Line)"#, title = "Wt"
+       ) +
+  scale_y_continuous(expand = c(0, 0)) + 
+  # coord_cartesian(ylim = c(20, max(spline_df$y) * 1.1)) +  # Apply visual cutoff without removing data
+  #coord_cartesian(ylim = c(20, 130)) +
+  scale_x_continuous(
+    breaks = df_CTRL_participation$node_numeric,
+    labels = df_CTRL_participation$node)+
+  coord_flip()+
+  theme(axis.text.y = element_text(size = 8))
+
+##############################################
+# Using participation.coeff
+df_CTRL_participation <- data.frame(
+  node = V(g_CTRL_S4)$name,
+  participation_coeff = participation.coeff(g_CTRL_S4, comm_ctrl),
+  hub_score = eigen_centrality(g_CTRL_S4)$vector
+)
+
+# For TEST network
+df_TEST_participation <- data.frame(
+  node = V(g_TEST_S4)$name,
+  participation_coeff = participation.coeff(g_TEST_S4, comm_test),
+  hub_score = eigen_centrality(g_TEST_S4)$vector
+)
+
+
+centrality_threshold <- quantile(df_CTRL_participation$hub_score, 0.80)
+participation_threshold <-quantile(df_CTRL_participation$participation_coeff, 0.80)
+
+df_CTRL_participation <- df_CTRL_participation %>%
+  mutate(
+    role = case_when(
+      hub_score >= centrality_threshold & participation_coeff >= participation_threshold ~ "Connector Hub",
+      hub_score >= centrality_threshold & participation_coeff < participation_threshold ~ "Provincial Hub",
+      hub_score < centrality_threshold & participation_coeff >= participation_threshold ~ "Non-Hub Connector",
+      TRUE ~ "Peripheral Node"
+    )
+  )
+
+centrality_threshold <- quantile(df_TEST_participation$hub_score, 0.80)
+participation_threshold <-quantile(df_TEST_participation$participation_coeff, 0.80)
+df_TEST_participation <- df_TEST_participation %>%
+  mutate(
+    role = case_when(
+      hub_score >= centrality_threshold & participation_coeff >= participation_threshold ~ "Connector Hub",
+      hub_score >= centrality_threshold & participation_coeff < participation_threshold ~ "Provincial Hub",
+      hub_score < centrality_threshold & participation_coeff >= participation_threshold ~ "Non-Hub Connector",
+      TRUE ~ "Peripheral Node"
+    )
+  )
+
+
+```
+
+# Differences in centrality
+```{r}
+## Hub score
+hubscore_difference <- hub_score(g_TEST_S4, scale = F)$vector - hub_score(g_CTRL_S4, scale = F)$vector
+
+df_hubscore_difference <- tibble(
+  node = names(hubscore_difference),
+  difference = hubscore_difference)
+
+df_hubscore_difference <- df_hubscore_difference %>%
+  arrange(desc(difference))
+df_hubscore_difference <- df_hubscore_difference %>%
+  filter(!is.na(Label))
+
+p_hub_diff <- ggplot(df_hubscore_difference, aes(x = reorder(node, difference), y = difference, fill = difference)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3) + 
+  theme_minimal() +
+  labs(y = "Δ Hub score (TetTag-hM3Dq - Wt)") +
+  #theme(axis.text.x = element_text(hjust = 1))+
+  coord_flip()+
+  scale_fill_viridis()+
+  custom_theme_r()+
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 8)) 
+```
+
+## Permutation
+```{r}
+n_rewire <- 10000
+
+# For CTRL Network
+hub_scores_CTRL_rewired <- matrix(0, nrow = n_rewire, ncol = vcount(g_CTRL_S4))
+colnames(hub_scores_CTRL_rewired) <- V(g_CTRL_S4)$name
+
+# Compute observed hub scores
+hub_scores_CTRL_observed <- hub_score(g_CTRL_S4, scale = FALSE)$vector
+
+# Perform rewiring and compute hub scores
+set.seed(123)  # For reproducibility
+for (i in 1:n_rewire) {
+  # Rewire the network while keeping the degree sequence
+  g_rewired <- rewire(g_CTRL_S4, with = keeping_degseq(niter = ecount(g_CTRL_S4) * 10))
+  
+  # Compute hub scores for the rewired network
+  hub_scores <- hub_score(g_rewired, scale = FALSE)$vector
+  
+  # Store the hub scores
+  hub_scores_CTRL_rewired[i, ] <- hub_scores
+}
+
+# For TEST Network
+# Initialize a matrix to store hub scores
+hub_scores_TEST_rewired <- matrix(0, nrow = n_rewire, ncol = vcount(g_TEST_S4))
+colnames(hub_scores_TEST_rewired) <- V(g_TEST_S4)$name
+
+# Compute observed hub scores
+hub_scores_TEST_observed <- hub_score(g_TEST_S4, scale = FALSE)$vector
+
+# Perform rewiring and compute hub scores
+set.seed(456)  # Different seed for TEST network
+for (i in 1:n_rewire) {
+  # Rewire the network while keeping the degree sequence
+  g_rewired <- rewire(g_TEST_S4, with = keeping_degseq(niter = ecount(g_TEST_S4) * 10))
+  
+  # Compute hub scores for the rewired network
+  hub_scores <- hub_score(g_rewired, scale = FALSE)$vector
+  
+  # Store the hub scores
+  hub_scores_TEST_rewired[i, ] <- hub_scores
+}
+
+# Build Null Distributions and Compute p-values
+# Initialize a data frame to store results
+df_CTRL <- tibble(
+  node = names(hub_scores_CTRL_observed),
+  observed_hub_score = hub_scores_CTRL_observed
+)
+
+# Compute p-values
+p_values_CTRL <- sapply(1:length(hub_scores_CTRL_observed), function(j) {
+  # Proportion of rewired hub scores >= observed hub score
+  mean(hub_scores_CTRL_rewired[, j] >= hub_scores_CTRL_observed[j])
+})
+
+# Add p-values to the data frame
+df_CTRL <- df_CTRL %>%
+  mutate(p_value = p_values_CTRL)
+
+# Adjust p-values for multiple testing
+df_CTRL <- df_CTRL %>%
+  mutate(adj_p_value = p.adjust(p_value, method = "BH"))
+# Initialize a data frame to store results
+df_TEST <- tibble(
+  node = names(hub_scores_TEST_observed),
+  observed_hub_score = hub_scores_TEST_observed
+)
+
+# Compute p-values
+p_values_TEST <- sapply(1:length(hub_scores_TEST_observed), function(j) {
+  # Proportion of rewired hub scores >= observed hub score
+  mean(hub_scores_TEST_rewired[, j] >= hub_scores_TEST_observed[j])
+})
+
+# Add p-values to the data frame
+df_TEST <- df_TEST %>%
+  mutate(p_value = p_values_TEST)
+
+# Adjust p-values for multiple testing
+df_TEST <- df_TEST %>%
+  mutate(adj_p_value = p.adjust(p_value, method = "BH"))
+
+# Compare Hub Scores Between CTRL and TEST ###
+# Generate Null Distribution of Differences
+# Initialize a matrix to store differences
+hub_score_differences_rewired <- matrix(0, nrow = n_rewire, ncol = vcount(g_CTRL_S4))
+colnames(hub_score_differences_rewired) <- V(g_CTRL_S4)$name
+
+# Assuming the node names are the same in both networks
+for (i in 1:n_rewire) {
+  # Differences between hub scores from rewired CTRL and TEST networks
+  hub_score_differences_rewired[i, ] <- hub_scores_TEST_rewired[i, ] - hub_scores_CTRL_rewired[i, ]
+}
+
+observed_differences <- hub_scores_TEST_observed - hub_scores_CTRL_observed
+
+# p values
+# Initialize a data frame to store results
+df_differences <- tibble(
+  node = names(observed_differences),
+  observed_difference = observed_differences
+)
+
+# Compute p-values
+p_values_differences <- sapply(1:length(observed_differences), function(j) {
+  # Two-tailed test
+  mean(abs(hub_score_differences_rewired[, j]) >= abs(observed_differences[j]))
+})
+
+# Add p-values to the data frame
+df_differences <- df_differences %>%
+  mutate(p_value = p_values_differences)
+
+# Adjust p-values for multiple testing
+df_differences <- df_differences %>%
+  mutate(adj_p_value = p.adjust(p_value, method = "BH"))
+
+# Arrange and display the results
+df_differences <- df_differences %>%
+  arrange(adj_p_value)
+
+print(df_differences, n = 100)
+
+## Visualize the null distributions 
+node_to_plot <- "LDT"  # Replace with the node of interest
+
+# Extract the observed difference and null distribution for the node
+obs_diff <- observed_differences[node_to_plot]
+null_diffs <- hub_score_differences_rewired[, node_to_plot]
+
+# Create a histogram
+ggplot() +
+  geom_histogram(aes(x = null_diffs), bins = 50, fill = "lightblue", color = "black") +
+  geom_vline(xintercept = obs_diff, color = "red", linetype = "dashed") +
+  labs(
+    title = paste("Null Distribution of Hub Score Differences for Node:", node_to_plot),
+    x = "Hub Score Difference (TEST - CTRL)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+
+df_hubscore_difference <- df_differences %>%
+  select(node, observed_difference, p_value, adj_p_value) %>%
+  rename(difference = observed_difference)
+
+df_hubscore_difference <- df_hubscore_difference %>%
+  mutate(significant = ifelse(p_value < 0.05, "*", ""))
+
+ggplot(df_hubscore_difference, aes(x = reorder(node, difference), y = difference, fill = difference)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3) + 
+  geom_text(aes(label = significant), hjust = -0.2, size = 5) +
+  theme_minimal() +
+  labs(y = "Δ Hub score (TEST - CTRL)") +
+  coord_flip() +
+  scale_fill_viridis() +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 12)
+  )
+
+```
+
+
+# Disruption propagation model (DPM)
+## With multiple iterations
+```{r}
+remove_node <- function(g, node) {
+  g <- delete.vertices(g, node)
+  return(g)
+}
+
+propagate_disruption <- function(g, deleted_edges_weights, max_iterations = 2) {
+  for(iter in 1:max_iterations) {
+    # For each edge in the graph
+    for(e in E(g)) {
+      src <- get.edges(g, e)[1]
+      dest <- get.edges(g, e)[2]
+      
+      # Calculate edge update based on the formula provided
+      weight_adjustment <- sum(deleted_edges_weights) / (degree(g, src) + degree(g, dest))
+      
+      # Update the edge weight
+      E(g)[e]$weight <- E(g)[e]$weight - weight_adjustment
+      
+      # Edge weights shouldn't be negative, so set them to zero if they are
+      if(E(g)[e]$weight < 0) {
+        E(g)[e]$weight <- 0
+      }
+    }
+  }
+  return(g)
+}
+
+threshold_graph <- function(g, threshold = as.numeric(cutoff)) { # or add a value to treshold, such as 0.5
+  E(g)[E(g)$weight < threshold]$weight <- 0
+  return(g)
+}
+
+delta_global_efficiency <- function(g_original, g_disrupted) {
+  efficiency_original <- Global_efficiency(g_original)
+  efficiency_disrupted <- Global_efficiency(g_disrupted)
+  return(efficiency_original - efficiency_disrupted)
+}
+
+# DPM with multiple iterations
+apply_DPM_separate_iterations <- function(g, threshold, max_iterations = 5) {
+  nodes <- V(g)
+  # Initialize a dataframe to store the effects for each node across different numbers of iterations
+  results_df <- data.frame(node = names(nodes), matrix(ncol = max_iterations, nrow = length(nodes)))
+  colnames(results_df)[-1] <- paste0("Iteration_", 1:max_iterations)
+  
+  original_g <- g # Keep a copy of the original graph to reset after each set of iterations
+  
+  for(node_id in seq_along(nodes)) {
+    for(iter in 1:max_iterations) {
+      # Reset the graph to its original state for each iteration set
+      g <- original_g
+      
+      # Store weights of edges to be deleted for disruption calculation, specific to the node
+      incident_edges <- incident(g, nodes[node_id])
+      deleted_edges_weights <- E(g)[incident_edges]$weight
+      
+      # Remove the node to simulate initial disruption
+      g <- remove_node(g, nodes[node_id])
+      
+      # Apply propagation and thresholding iteratively, according to the current iteration set
+      for(j in 1:iter) {
+        g <- propagate_disruption(g, deleted_edges_weights, 1) # Apply propagation for 1 iteration at a time
+        g <- threshold_graph(g, threshold) # Apply thresholding
+      }
+      
+      # Calculate the change in global efficiency and store it
+      delta_ge <- delta_global_efficiency(original_g, g)
+      results_df[node_id, iter + 1] <- delta_ge
+    }
+  }
+  
+  return(results_df)
+}
+
+
+# TEST ####
+delta_ge_iterations <- apply_DPM_separate_iterations(g_TEST_S4, 0, 1)
+delta_ge_iterations <- delta_ge_iterations %>% pivot_longer(cols = 2:2, names_to = "Iteration", values_to = "delta_GE")
+
+p_delta_ge_test <- ggplot(delta_ge_iterations, aes(x = reorder(node, -delta_GE), y = delta_GE, fill = delta_GE)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3) +
+  theme_minimal() +
+  scale_fill_gradient2(limits = c(-0.003, 0.151))+
+  labs(title = "TetTag-hM3Dq",
+       y = "Δ Global Efficiency") +
+  scale_y_continuous(limits = c(-0.003, 0.151))+
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  custom_theme_r()+
+  theme(axis.title.y = element_blank(), legend.position = "none")+
+  #facet_wrap(~Iteration, nrow = 1)+
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 8))
+
+# CTRL ####
+delta_ge_iterations_ctrl <- apply_DPM_separate_iterations(g_CTRL_S4, 0, 1)
+delta_ge_iterations_ctrl <- delta_ge_iterations_ctrl %>% pivot_longer(cols = 2:2, names_to = "Iteration", values_to = "delta_GE")
+
+p_delta_ge_control <- ggplot(delta_ge_iterations_ctrl, aes(x = reorder(node, -delta_GE), y = delta_GE, fill = delta_GE)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3) +
+  theme_minimal() +
+  scale_fill_gradient2(limits = c(-0.003, 0.151))+
+  labs(title = "Wt",
+       y = "Δ Global Efficiency") +
+  scale_y_continuous(limits = c(-0.003, 0.151))+
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  custom_theme_r()+
+  theme(axis.title.y = element_blank(), legend.position = "none")+
+  #facet_wrap(~Iteration, nrow = 1)+
+  coord_flip()+
+  theme(axis.text.y = element_text(size = 8))
+
+
+p_delta_ge <- grid.arrange(p_delta_ge_control , p_delta_ge_test, ncol = 2)
+
+
+grid.arrange(p_hub_diff+theme(legend.position = "none", plot.title = element_text(size = 9))+labs(title = "bla"), p_delta_ge_control+theme(plot.title = element_text(size = 9)), p_delta_ge_test+theme(plot.title = element_text(size = 9)), ncol = 3,
+             heights = unit(7, "cm"))
+
+
+
+```
+
+
+## Corr deltaG vs Hub score
+```{r}
+delta_ge_hub_ctrl <- delta_ge_iterations_ctrl %>%
+  left_join(df_CTRL, by = "node") %>%
+  select(-p_value, -adj_p_value) %>%
+  mutate(Group = "Wt")
+
+delta_ge_hub_test <- delta_ge_iterations %>%
+  left_join(df_TEST, by = "node") %>%
+  select(-p_value, -adj_p_value) %>%
+  mutate(Group = "TetTag-hM3Dq")
+
+delta_ge_hub_combined <- rbind(delta_ge_hub_ctrl, delta_ge_hub_test)
+
+delta_ge_hub_combined %>%
+  #group_by(Group) %>%
+  cor_test(delta_GE, observed_hub_score)
+
+delta_ge_hub_combined$Group <- factor(delta_ge_hub_combined$Group, levels = c("Wt", "TetTag-hM3Dq"))
+
+p_deltag_hub_cor <- delta_ge_hub_combined %>%
+  ggplot(aes(x = observed_hub_score, y = delta_GE))+
+  geom_point(aes(fill = Group), shape = 21, size = 2)+
+  geom_smooth(method = "lm", color = "black")+
+  theme_classic()+
+  custom_theme_r()+
+  theme(legend.position = "right")+
+  scale_fill_manual(values = palette1) +
+  labs(x = "Hub score", y = "Δ Global Efficiency")
+
+
+p_hub_diff <- p_hub_diff+theme(legend.position = "none", plot.title = element_text(size = 9))+labs(title = "bla")
+p_delta_ge_control <- p_delta_ge_control+theme(plot.title = element_text(size = 9))
+p_delta_ge_test <- p_delta_ge_test+theme(plot.title = element_text(size = 9))
+p_delta_ge_combined <- ggarrange(p_delta_ge_control, p_delta_ge_test)
+
+# 3 x 8
+grid.arrange(p_hub_diff, p_delta_ge_combined, p_deltag_hub_cor + labs(title = "bla"), 
+          nrow = 1, widths = c(0.3, 0.3, 0.4),
+          heights = unit(7, "cm"))
+
+
+####
+# 5 x 8
+p_comm_diversity 
+grid.arrange(
+ggarrange(p_comm_diversity+theme(legend.position = "right"), p_hub_diff),
+ggarrange(p_delta_ge_combined, p_deltag_hub_cor),
+nrow = 2,
+heights = unit(c(5.5,5.5), "cm")
+)
+##
+p_comm_diversity2 <- p_comm_diversity+theme(legend.position = "bottom", title = element_blank())
+p_role <- ggarrange(p_role_ctrl, p_role_test, common.legend = TRUE, legend = "bottom")
+
+p_line1 <- grid.arrange(
+  ggplotGrob(p_comm_diversity2),
+  ggplotGrob(p_role),
+  ncol = 2,
+  widths = c(0.5, 1)
+)
+
+p_line2 <- grid.arrange(
+  ggplotGrob(p_hub_diff),
+  ggplotGrob(p_delta_ge_combined),
+  ggplotGrob(p_deltag_hub_cor+theme(legend.position = "none")),
+  ncol = 3,
+  widths = c(0.6, 1, 0.6)
+)
+
+grid.arrange(
+p_line1,
+p_line2,
+nrow = 2,
+heights = unit(c(6.5,5.5), "cm")
+)
+
+
+```
+
+## Panel
+```{r}
+p_comm_diversity2 <- p_comm_diversity+theme(legend.position = "bottom", title = element_blank())
+p_role <- ggarrange(p_role_ctrl, p_role_test, common.legend = TRUE, legend = "bottom")
+
+p_line1 <- grid.arrange(
+  ggplotGrob(p_comm_diversity2),
+  ggplotGrob(p_role),
+  ncol = 2,
+  widths = c(0.5, 1)
+)
+
+p_line2 <- grid.arrange(
+  ggplotGrob(p_hub_diff),
+  ggplotGrob(p_delta_ge_combined),
+  ggplotGrob(p_deltag_hub_cor+theme(legend.position = "none")),
+  ncol = 3,
+  widths = c(0.6, 1, 0.6)
+)
+
+grid.arrange(
+p_line1,
+p_line2,
+nrow = 2,
+heights = unit(c(8,7), "cm")
+)
+```
+
+
+
+
+# Behavior
+
+```{r}
+dreadds_palette <- c("#3E3E3E", "#0476D0")
+
+# Acquisition by Day
+p_acquisition <- Behavior %>% 
+  dplyr::filter(Session == "Acquisition") %>%
+  ggplot(aes(x = Day, y = Correct, color = Group, fill = Group)) +
+  geom_ribbon(data = (Behavior %>% 
+                        dplyr::filter(Session == "Acquisition") %>%
+                        group_by(Group, Session2, Day) %>% 
+                        summarise(
+                          sem = sd(Correct) / sqrt(n()),
+                          average = mean(Correct),
+                          .groups = "drop")),
+              aes(x = Day, ymin = average - sem, ymax = average + sem, group = Group, fill = Group),
+              alpha = 0.2, inherit.aes = FALSE, show.legend = FALSE) +
+  geom_line(data = (Behavior %>% 
+                      dplyr::filter(Session == "Acquisition") %>%
+                      group_by(Group, Session2, Day) %>% 
+                      summarise(average = mean(Correct), .groups = "drop")),
+            aes(x = Day, y = average, color = Group, group = Group), size = 0.8, show.legend = FALSE) +
+  geom_point(data = (Behavior %>% 
+                       dplyr::filter(Session == "Acquisition") %>%
+                       group_by(Group, Session2, Day) %>% 
+                       summarise(average = mean(Correct), .groups = "drop")),
+             aes(x = Day, y = average, fill = Group), shape = 21, color = "black", size = 2.7) +
+  geom_hline(yintercept = 50, linetype = 'dashed', col = 'black', size = 0.5) +
+  labs(x = NULL, y = "% Correct choices") +
+  guides(color = guide_legend(" ")) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.text.x = element_text(size = 6),
+    axis.text.y = element_text(size = 6, margin = margin(r = 1)),
+    axis.ticks.x.bottom = element_blank(),
+    axis.line = element_line(linewidth = 0.08),
+    axis.ticks = element_line(linewidth = 0.05),
+    axis.ticks.length = unit(0.05, "cm"),  # Shorter ticks
+    legend.text = element_text(size = 8),
+    strip.background = element_rect(fill = "#ebeff2", color = NA),
+    strip.text = element_text(size = 7, margin = margin(1, 1, 1, 1)),
+    axis.title.y = element_text(size = 8),
+    axis.title.x = element_text(size = 7),
+    plot.title = element_text(size = 8))+
+  scale_y_continuous(breaks = seq(20, 100, by = 20), limits = c(35, 90)) +
+  scale_color_manual(values = dreadds_palette) +
+  scale_fill_manual(values = dreadds_palette) +
+  facet_wrap(~Session)
+
+## Extinction 10
+p_extinction <- Behavior %>% 
+  dplyr::filter(Session == "Extinction") %>%
+  mutate(Block_10 = paste("Block", Block_10)) %>%
+  ggplot(aes(x = Block_10, y = Correct, color = Group, fill = Group)) +
+  geom_ribbon(data = (Behavior %>% 
+                        dplyr::filter(Session == "Extinction") %>%
+                        mutate(Block_10 = paste("Block", Block_10)) %>%
+                        group_by(Group, Session2, Block_10) %>% 
+                        summarise(
+                          sem = sd(Correct) / sqrt(n()),
+                          average = mean(Correct),
+                          .groups = "drop")),
+              aes(x = Block_10, ymin = average - sem, ymax = average + sem, group = Group, fill = Group),
+              alpha = 0.2, inherit.aes = FALSE, show.legend = FALSE) +
+  geom_line(data = (Behavior %>% 
+                      dplyr::filter(Session == "Extinction") %>%
+                      mutate(Block_10 = paste("Block", Block_10)) %>%
+                      group_by(Group, Session2, Block_10) %>% 
+                      summarise(average = mean(Correct), .groups = "drop")),
+            aes(x = Block_10, y = average, color = Group, group = Group), size = 0.8, show.legend = FALSE) +
+  geom_point(data = (Behavior %>% 
+                       dplyr::filter(Session == "Extinction") %>%
+                       mutate(Block_10 = paste("Block", Block_10)) %>%
+                       group_by(Group, Session2, Block_10) %>% 
+                       summarise(average = mean(Correct), .groups = "drop")),
+             aes(x = Block_10, y = average, fill = Group), shape = 21, color = "black", size = 2.7) +
+  geom_hline(yintercept = 50, linetype = 'dashed', col = 'black', size = 0.5) +
+  labs(x = NULL, y = "% Correct choices") +
+  guides(color = guide_legend(" ")) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.text.x = element_text(size = 6),
+    axis.text.y = element_text(size = 6, margin = margin(r = 1)),
+    axis.ticks.x.bottom = element_blank(),
+    axis.line = element_line(linewidth = 0.08),
+    axis.ticks = element_line(linewidth = 0.05),
+    axis.ticks.length = unit(0.05, "cm"),  # Shorter ticks
+    legend.text = element_text(size = 8),
+    strip.background = element_rect(fill = "#ebeff2", color = NA),
+    strip.text = element_text(size = 7, margin = margin(1, 1, 1, 1)),
+    axis.title.y = element_text(size = 8),
+    axis.title.x = element_text(size = 7),
+    plot.title = element_text(size = 8))+
+  scale_y_continuous(breaks = seq(20, 100, by = 20), limits = c(35, 90)) +
+  scale_color_manual(values = dreadds_palette) +
+  scale_fill_manual(values = dreadds_palette) +
+  facet_grid(~Session2, space = "free_x", scales = "free_x") +
+  stat_compare_means(aes(label = ..p.signif..), method = "wilcox", 
+                     hide.ns = TRUE, label.y = 80, size = 4, show.legend = FALSE)
+
+
+# 3 x 7.5
+gridExtra::grid.arrange(p_acquisition, p_extinction, ncol = 2, widths = unit(c(8, 6), "cm"), heights = unit(6, "cm") )
+
+
+# Statistics ###################################################################
+# Normality
+Behavior %>%
+  filter(Session == "Extinction") %>%
+  filter(Day == "Day 7") %>% 
+  ungroup()%>%
+  shapiro_test(Correct)
+
+Behavior %>%
+  filter(Session == "Extinction") %>%
+  group_by(Day) %>%
+  shapiro_test(Correct)
+
+Behavior %>%
+  filter(Session == "Acquisition") %>%
+  ungroup()%>%
+  #group_by(Day) %>%
+  shapiro_test(Correct)
+
+# Non parametric
+## Acquisition
+Behavior %>%
+  filter(Session == "Acquisition") %>%
+  group_by(Block_10) %>%
+  wilcox_test(Correct ~ Group, paired = FALSE, detailed = TRUE)
+
+Behavior %>%
+  filter(Session == "Acquisition") %>%
+  group_by(Group) %>%
+  wilcox_test(Correct ~ Day, paired = FALSE, detailed = TRUE) %>%
+  filter(p < 0.05) %>%
+  select(-alternative) %>%
+  print(n = 100)
+
+Behavior %>%
+  filter(Session == "Acquisition") %>%
+  group_by(Group) %>%
+  wilcox_test(Correct ~ Block_10, paired = FALSE, detailed = TRUE) %>%
+  filter(p < 0.05) %>%
+  select(-alternative) %>%
+  print(n = 100)
+
+Behavior %>%
+  filter(Session == "Acquisition") %>%
+  group_by(Group) %>%
+  pairwise_wilcox_test(Correct ~ Day, detailed = TRUE) %>%
+  filter(p < 0.05) %>%
+  select(-alternative) %>%
+  print(n = 100)
+
+
+## Extinction
+Behavior %>%
+  filter(Session == "Extinction") %>%
+  group_by(Day, Block_10) %>%
+  wilcox_test(Correct ~ Group, paired = FALSE, detailed = TRUE)
+
+Behavior %>%
+  filter(Session == "Extinction") %>%
+  group_by(Group) %>%
+  pairwise_wilcox_test(Correct ~ Block_10, detailed = TRUE, p.adjust.method = "none") %>%
+  select(-alternative)
+
+
+```
+
+## Control experiment
+```{r}
+p_Control_acquisition <- Behavior_control %>% 
+  dplyr::filter(Session == "Acquisition") %>%
+  ggplot(aes(x = Day, y = Correct, color = Group, fill = Group)) +
+  geom_ribbon(data = (Behavior_control %>% 
+                        dplyr::filter(Session == "Acquisition") %>%
+                        group_by(Group, Session2, Day) %>% 
+                        summarise(
+                          sem = sd(Correct) / sqrt(n()),
+                          average = mean(Correct),
+                          .groups = "drop")),
+              aes(x = Day, ymin = average - sem, ymax = average + sem, group = Group, fill = Group),
+              alpha = 0.2, inherit.aes = FALSE, show.legend = FALSE) +
+  geom_line(data = (Behavior_control %>% 
+                      dplyr::filter(Session == "Acquisition") %>%
+                      group_by(Group, Session2, Day) %>% 
+                      summarise(average = mean(Correct), .groups = "drop")),
+            aes(x = Day, y = average, color = Group, group = Group), size = 0.8, show.legend = FALSE) +
+  geom_point(data = (Behavior_control %>% 
+                       dplyr::filter(Session == "Acquisition") %>%
+                       group_by(Group, Session2, Day) %>% 
+                       summarise(average = mean(Correct), .groups = "drop")),
+             aes(x = Day, y = average, fill = Group), shape = 21, color = "black", size = 2.7) +
+  geom_hline(yintercept = 50, linetype = 'dashed', col = 'black', size = 0.5) +
+  labs(x = NULL, y = "% Correct choices") +
+  guides(color = guide_legend(" ")) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.text.x = element_text(size = 6),
+    axis.text.y = element_text(size = 6, margin = margin(r = 1)),
+    axis.ticks.x.bottom = element_blank(),
+    axis.line = element_line(linewidth = 0.08),
+    axis.ticks = element_line(linewidth = 0.05),
+    axis.ticks.length = unit(0.05, "cm"),  # Shorter ticks
+    legend.text = element_text(size = 8),
+    strip.background = element_rect(fill = "#ebeff2", color = NA),
+    strip.text = element_text(size = 7, margin = margin(1, 1, 1, 1)),
+    axis.title.y = element_text(size = 8),
+    axis.title.x = element_text(size = 7),
+    plot.title = element_text(size = 8))+
+  scale_y_continuous(breaks = seq(20, 100, by = 20), limits = c(35, 90)) +
+  scale_color_manual(values = dreadds_palette) +
+  scale_fill_manual(values = dreadds_palette) +
+  facet_wrap(~Session)
+
+## Extinction 10
+p_Control_extinction <- Behavior_control %>% 
+  dplyr::filter(Session == "Extinction") %>%
+  mutate(Block_10 = paste("Block", Block_10)) %>%
+  ggplot(aes(x = Block_10, y = Correct, color = Group, fill = Group)) +
+  geom_ribbon(data = (Behavior_control %>% 
+                        dplyr::filter(Session == "Extinction") %>%
+                        mutate(Block_10 = paste("Block", Block_10)) %>%
+                        group_by(Group, Session2, Block_10) %>% 
+                        summarise(
+                          sem = sd(Correct) / sqrt(n()),
+                          average = mean(Correct),
+                          .groups = "drop")),
+              aes(x = Block_10, ymin = average - sem, ymax = average + sem, group = Group, fill = Group),
+              alpha = 0.2, inherit.aes = FALSE, show.legend = FALSE) +
+  geom_line(data = (Behavior_control %>% 
+                      dplyr::filter(Session == "Extinction") %>%
+                      mutate(Block_10 = paste("Block", Block_10)) %>%
+                      group_by(Group, Session2, Block_10) %>% 
+                      summarise(average = mean(Correct), .groups = "drop")),
+            aes(x = Block_10, y = average, color = Group, group = Group), size = 0.8, show.legend = FALSE) +
+  geom_point(data = (Behavior_control %>% 
+                       dplyr::filter(Session == "Extinction") %>%
+                       mutate(Block_10 = paste("Block", Block_10)) %>%
+                       group_by(Group, Session2, Block_10) %>% 
+                       summarise(average = mean(Correct), .groups = "drop")),
+             aes(x = Block_10, y = average, fill = Group), shape = 21, color = "black", size = 2.7) +
+  geom_hline(yintercept = 50, linetype = 'dashed', col = 'black', size = 0.5) +
+  labs(x = NULL, y = "% Correct choices") +
+  guides(color = guide_legend(" ")) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.text.x = element_text(size = 6),
+    axis.text.y = element_text(size = 6, margin = margin(r = 1)),
+    axis.ticks.x.bottom = element_blank(),
+    axis.line = element_line(linewidth = 0.08),
+    axis.ticks = element_line(linewidth = 0.05),
+    axis.ticks.length = unit(0.05, "cm"),  # Shorter ticks
+    legend.text = element_text(size = 8),
+    strip.background = element_rect(fill = "#ebeff2", color = NA),
+    strip.text = element_text(size = 7, margin = margin(1, 1, 1, 1)),
+    axis.title.y = element_text(size = 8),
+    axis.title.x = element_text(size = 7),
+    plot.title = element_text(size = 8))+
+  scale_y_continuous(breaks = seq(20, 100, by = 20), limits = c(35, 90)) +
+  scale_color_manual(values = dreadds_palette) +
+  scale_fill_manual(values = dreadds_palette) +
+  facet_grid(~Session2, space = "free_x", scales = "free_x") +
+  stat_compare_means(aes(label = ..p.signif..), method = "wilcox", 
+                     hide.ns = TRUE, label.y = 80, size = 4, show.legend = FALSE)
+
+
+# 3 x 7.5
+gridExtra::grid.arrange(p_Control_acquisition, p_Control_extinction, ncol = 2, widths = unit(c(8, 6), "cm"), heights = unit(6, "cm") )
+
+# Statistics ###################################################################
+
+# Normality
+Behavior_control %>%
+  filter(Session == "Extinction") %>%
+  group_by(Day) %>%
+  shapiro_test(Correct)
+
+Behavior_control %>%
+  filter(Session == "Extinction") %>%
+  filter(Day == "Day 7") %>% 
+  ungroup()%>%
+  shapiro_test(Correct)
+
+Behavior_control %>%
+  filter(Session == "Extinction") %>%
+  group_by(Day) %>%
+  shapiro_test(Correct)
+
+Behavior_control %>%
+  filter(Session == "Acquisition") %>%
+  ungroup()%>%
+  #group_by(Day) %>%
+  shapiro_test(Correct)
+
+Behavior_control %>%
+  filter(Session == "Acquisition") %>%
+  ungroup()%>%
+  #group_by(Day) %>%
+  shapiro_test(Correct)
+
+Behavior_control %>%
+  filter(Session == "Acquisition") %>%
+  ungroup()%>%
+  group_by(Day) %>%
+  shapiro_test(Correct)
+
+# Non parametric
+
+## Acquisition
+Behavior_control %>%
+  filter(Session == "Acquisition") %>%
+  group_by(Block_10) %>%
+  wilcox_test(Correct ~ Group, paired = FALSE, detailed = TRUE)
+
+Behavior_control %>%
+  filter(Session == "Acquisition") %>%
+  group_by(Group) %>%
+  wilcox_test(Correct ~ Day, paired = FALSE, detailed = TRUE) %>%
+  filter(p < 0.05) %>%
+  select(-alternative) %>%
+  print(n = 100)
+
+Behavior_control %>%
+  filter(Session == "Acquisition") %>%
+  group_by(Group) %>%
+  wilcox_test(Correct ~ Block_10, paired = FALSE, detailed = TRUE) %>%
+  filter(p < 0.05) %>%
+  select(-alternative) %>%
+  print(n = 100)
+
+Behavior_control %>%
+  filter(Session == "Acquisition") %>%
+  group_by(Group) %>%
+  pairwise_wilcox_test(Correct ~ Day, detailed = TRUE) %>%
+  filter(p < 0.05) %>%
+  select(-alternative) %>%
+  print(n = 100)
+
+
+## Extinction
+Behavior_control %>%
+  filter(Session == "Extinction") %>%
+  group_by(Day, Block_10) %>%
+  wilcox_test(Correct ~ Group, paired = FALSE, detailed = TRUE)
+
+Behavior_control %>%
+  filter(Session == "Extinction") %>%
+  group_by(Group) %>%
+  pairwise_wilcox_test(Correct ~ Block_10, detailed = TRUE, p.adjust.method = "none") %>%
+  select(-alternative)
+
+
+```
+
+
+
+
+
+
